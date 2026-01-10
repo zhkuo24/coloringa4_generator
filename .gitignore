@@ -1,0 +1,43 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Virtual environments
+venv/
+env/
+.venv/
+ENV/
+
+# Distribution / packaging
+build/
+dist/
+egg-info/
+*.egg
+pip-wheel-metadata/
+
+# IDEs and editors
+.idea/
+.vscode/
+*.sublime-workspace
+
+# OS files
+.DS_Store
+
+# Test / coverage
+.pytest_cache/
+.tox/
+.coverage
+coverage.xml
+
+# Mypy
+.mypy_cache/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Env files
+.env
+.env.*
+
