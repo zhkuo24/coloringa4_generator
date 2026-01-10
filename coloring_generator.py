@@ -19,6 +19,40 @@ from datetime import datetime
 from typing import Optional, Literal
 from dataclasses import dataclass
 from enum import Enum
+from pathlib import Path
+
+# 加载 .env 文件
+try:
+    from dotenv import load_dotenv
+    # 从当前目录和脚本目录查找 .env
+    env_paths = [
+        Path.cwd() / ".env",
+        Path(__file__).parent / ".env"
+    ]
+    for env_path in env_paths:
+        if env_path.exists():
+            load_dotenv(env_path)
+            break
+except ImportError:
+    # 如果没有安装 python-dotenv，手动解析 .env
+    def load_env_manual():
+        env_paths = [
+            Path.cwd() / ".env",
+            Path(__file__).parent / ".env"
+        ]
+        for env_path in env_paths:
+            if env_path.exists():
+                with open(env_path, 'r') as f:
+                    for line in f:
+                        line = line.strip()
+                        if line and not line.startswith('#') and '=' in line:
+                            key, value = line.split('=', 1)
+                            key = key.strip()
+                            value = value.strip().strip('"').strip("'")
+                            if key not in os.environ:
+                                os.environ[key] = value
+                break
+    load_env_manual()
 
 
 class AgeMode(Enum):
@@ -460,21 +494,20 @@ class OpenRouterImageGenerator:
     支持多种文生图模型
     """
 
+    # OpenRouter 支持的图像生成模型
+    # 通过 API 查询获取: GET https://openrouter.ai/api/v1/models
     SUPPORTED_MODELS = {
-        # Flux 系列 (推荐)
-        "flux-schnell": "black-forest-labs/flux-schnell",
-        "flux-pro": "black-forest-labs/flux-pro",
-        "flux-dev": "black-forest-labs/flux-1.1-pro",
+        # OpenAI GPT 图像系列
+        "gpt5-image": "openai/gpt-5-image",
+        "gpt5-image-mini": "openai/gpt-5-image-mini",
 
-        # Stable Diffusion 系列
-        "sdxl": "stabilityai/stable-diffusion-xl-base-1.0",
-        "sd3": "stabilityai/stable-diffusion-3",
+        # Google Gemini 图像系列 (推荐)
+        "gemini-image": "google/gemini-2.5-flash-image",
+        "gemini-image-preview": "google/gemini-2.5-flash-image-preview",
+        "gemini3-image": "google/gemini-3-pro-image-preview",
 
-        # DALL-E 系列
-        "dalle3": "openai/dall-e-3",
-
-        # 其他
-        "playground": "playgroundai/playground-v2.5-1024px-aesthetic",
+        # 默认推荐 (Gemini 速度快，效果好)
+        "default": "google/gemini-2.5-flash-image",
     }
 
     def __init__(self, api_key: Optional[str] = None):
@@ -488,9 +521,9 @@ class OpenRouterImageGenerator:
     def generate_from_text(
         self,
         scene: SceneInput,
-        model: str = "flux-schnell",
+        model: str = "gemini-image",
         width: int = 1024,
-        height: int = 1448,  # A4 比例 (1:1.414)
+        height: int = 1448,  # A4 比例
         save_path: Optional[str] = None
     ) -> dict:
         """
@@ -510,7 +543,7 @@ class OpenRouterImageGenerator:
         self,
         image_path: str,
         age_mode: AgeMode = AgeMode.KIDS,
-        model: str = "flux-schnell",
+        model: str = "gemini-image",
         width: int = 1024,
         height: int = 1448,
         save_path: Optional[str] = None
@@ -551,18 +584,14 @@ class OpenRouterImageGenerator:
             "X-Title": "Children Coloring Page Generator"
         }
 
-        # 构建请求
-        if "dall-e" in model_id:
-            payload = self._build_dalle_payload(prompts, model_id, width, height)
-            endpoint = f"{self.base_url}/chat/completions"
-        else:
-            payload = self._build_sd_payload(prompts, model_id, width, height, image_path)
-            endpoint = f"{self.base_url}/images/generations"
+        # OpenRouter 所有模型都通过 chat/completions endpoint
+        endpoint = f"{self.base_url}/chat/completions"
+        payload = self._build_payload(prompts, model_id, width, height, image_path)
 
         self._print_generation_info(prompts, model_id)
 
         try:
-            response = requests.post(endpoint, headers=headers, json=payload, timeout=120)
+            response = requests.post(endpoint, headers=headers, json=payload, timeout=180)
             response.raise_for_status()
             result = response.json()
 
@@ -582,14 +611,22 @@ class OpenRouterImageGenerator:
             }
 
         except requests.exceptions.RequestException as e:
+            error_msg = str(e)
+            # 尝试获取更详细的错误信息
+            try:
+                if hasattr(e, 'response') and e.response is not None:
+                    error_detail = e.response.json()
+                    error_msg = f"{error_msg}\n详细: {json.dumps(error_detail, ensure_ascii=False)}"
+            except:
+                pass
             return {
                 "success": False,
-                "error": str(e),
+                "error": error_msg,
                 "prompts": prompts,
                 "model": model_id
             }
 
-    def _build_sd_payload(
+    def _build_payload(
         self,
         prompts: dict,
         model_id: str,
@@ -597,65 +634,119 @@ class OpenRouterImageGenerator:
         height: int,
         image_path: Optional[str] = None
     ) -> dict:
-        """构建 SD/Flux 请求体"""
-        # 将 system prompt 和 user prompt 合并
+        """构建 OpenRouter API 请求体"""
+
+        # 合并 system prompt 和 user prompt 作为完整提示
         full_prompt = f"{prompts['system_prompt']}\n\n{prompts['user_prompt']}"
 
-        payload = {
-            "model": model_id,
-            "prompt": full_prompt,
-            "width": width,
-            "height": height,
-            "num_inference_steps": 30,
-            "guidance_scale": 7.5,
-            "num_outputs": 1,
-        }
+        # 构建消息
+        messages = [
+            {"role": "user", "content": full_prompt}
+        ]
 
-        # 如果是图生图，添加源图像
+        # 如果是图生图，添加图片
         if image_path:
             with open(image_path, "rb") as f:
                 image_b64 = base64.b64encode(f.read()).decode()
-            payload["image"] = image_b64
-            payload["strength"] = 0.75
+            # 获取图片类型
+            ext = Path(image_path).suffix.lower()
+            mime_type = {
+                ".jpg": "image/jpeg",
+                ".jpeg": "image/jpeg",
+                ".png": "image/png",
+                ".gif": "image/gif",
+                ".webp": "image/webp"
+            }.get(ext, "image/png")
+
+            messages = [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:{mime_type};base64,{image_b64}"
+                            }
+                        },
+                        {
+                            "type": "text",
+                            "text": full_prompt
+                        }
+                    ]
+                }
+            ]
+
+        payload = {
+            "model": model_id,
+            "messages": messages,
+        }
+
+        # 根据模型类型添加特定参数
+        if "flux" in model_id.lower():
+            # Flux 模型的图像参数
+            payload["provider"] = {
+                "sort": "throughput"
+            }
+            # 图像尺寸通过 prompt 指定或使用默认
+
+        elif "dall-e" in model_id.lower():
+            # DALL-E 特定参数
+            if height > width:
+                size = "1024x1792"
+            elif width > height:
+                size = "1792x1024"
+            else:
+                size = "1024x1024"
+            payload["size"] = size
+            payload["quality"] = "standard"
 
         return payload
-
-    def _build_dalle_payload(
-        self,
-        prompts: dict,
-        model_id: str,
-        width: int,
-        height: int
-    ) -> dict:
-        """构建 DALL-E 请求体"""
-        # 选择最接近的尺寸
-        if height > width:
-            size = "1024x1792"
-        elif width > height:
-            size = "1792x1024"
-        else:
-            size = "1024x1024"
-
-        return {
-            "model": model_id,
-            "messages": [
-                {"role": "system", "content": prompts["system_prompt"]},
-                {"role": "user", "content": prompts["user_prompt"]}
-            ],
-            "size": size,
-            "quality": "standard",
-            "n": 1
-        }
 
     def _extract_image(self, result: dict, model_id: str) -> Optional[str]:
         """提取图像数据"""
         try:
-            if "dall-e" in model_id:
-                return result.get("data", [{}])[0].get("url")
-            else:
-                data = result.get("data", [{}])[0]
-                return data.get("b64_json") or data.get("url")
-        except (IndexError, KeyError):
+            # OpenRouter 返回格式
+            choices = result.get("choices", [])
+            if choices:
+                message = choices[0].get("message", {})
+
+                # Gemini 图像模型: 图像在 message.images 数组中
+                images = message.get("images", [])
+                if images:
+                    first_image = images[0]
+                    if isinstance(first_image, dict):
+                        image_url = first_image.get("image_url", {})
+                        url = image_url.get("url", "")
+                        if url:
+                            return url
+                    elif isinstance(first_image, str):
+                        return first_image
+
+                # 检查 content 字段
+                content = message.get("content", "")
+
+                # 检查是否是 URL
+                if content and content.startswith("http"):
+                    return content
+
+                # 检查是否包含 markdown 图片链接
+                if content:
+                    import re
+                    url_match = re.search(r'!\[.*?\]\((https?://[^\)]+)\)', content)
+                    if url_match:
+                        return url_match.group(1)
+
+                    # 检查是否是 base64 data URL
+                    if content.startswith("data:image"):
+                        return content
+
+            # 旧格式兼容
+            data = result.get("data", [{}])
+            if data:
+                return data[0].get("b64_json") or data[0].get("url")
+
+        except (IndexError, KeyError) as e:
+            print(f"提取图像失败: {e}")
             return None
 
     def _save_image(self, image_data: str, save_path: str):
@@ -663,10 +754,21 @@ class OpenRouterImageGenerator:
         os.makedirs(os.path.dirname(save_path) or ".", exist_ok=True)
 
         if image_data.startswith("http"):
+            # URL 格式
             response = requests.get(image_data, timeout=60)
             with open(save_path, "wb") as f:
                 f.write(response.content)
+        elif image_data.startswith("data:image"):
+            # data URL 格式: data:image/png;base64,XXXX
+            # 提取 base64 部分
+            if "," in image_data:
+                base64_data = image_data.split(",", 1)[1]
+            else:
+                base64_data = image_data
+            with open(save_path, "wb") as f:
+                f.write(base64.b64decode(base64_data))
         else:
+            # 纯 base64 格式
             with open(save_path, "wb") as f:
                 f.write(base64.b64decode(image_data))
 
@@ -827,7 +929,7 @@ def test_full_generation(api_key: Optional[str] = None):
 
         result = generator.generate_from_text(
             scene=scene,
-            model="flux-schnell",
+            model="gemini-image",  # 使用 Gemini 图像模型
             save_path=save_path
         )
 
