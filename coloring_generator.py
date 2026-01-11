@@ -1,1070 +1,678 @@
 #!/usr/bin/env python3
 """
-儿童涂色卡生成器 - 通过 OpenRouter 调用文生图 API
-专业提示词系统版本
+儿童涂色卡生成器 v2（推荐方案一：单输入 idea）
+- OpenRouter chat/completions
+- system / user 分离 messages（更稳）
+- 支持：文生图（idea->image）、图生图（image->coloring）
+- 去掉：PNG->PDF / 矢量化 / reportlab / cairosvg / potrace 等后处理
+- 输出：PNG + JSON 记录
 
-输入格式: 物体 在 某某地方 做什么
-变量控制:
-1. Subject (谁/什么)
-2. Location (在哪里)
-3. Action (做什么)
-4. Age Mode (≤5 / ≥6)
+环境变量：
+  OPENROUTER_API_KEY=xxxx
+
+用法示例：
+  python coloring_generator_v2.py --batch --model gpt5-image-mini --out output_batch
+  python coloring_generator_v2.py --generate "A friendly dragon flying over a castle" --kids --portrait --model nano-banana-pro
+  python coloring_generator_v2.py --image2color ./input.jpg --kids --portrait --model gpt5-image-mini
+  python coloring_generator_v2.py --interactive
 """
 
 import os
 import json
+import time
 import base64
+import argparse
 import requests
-from datetime import datetime
-from typing import Optional, Literal
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
+from typing import Optional, Dict, Any, List
 
-# 加载 .env 文件
+# -------------------------
+# .env 加载（可选）
+# -------------------------
 try:
     from dotenv import load_dotenv
-    # 从当前目录和脚本目录查找 .env
-    env_paths = [
-        Path.cwd() / ".env",
-        Path(__file__).parent / ".env"
-    ]
-    for env_path in env_paths:
-        if env_path.exists():
-            load_dotenv(env_path)
-            break
-except ImportError:
-    # 如果没有安装 python-dotenv，手动解析 .env
-    def load_env_manual():
-        env_paths = [
-            Path.cwd() / ".env",
-            Path(__file__).parent / ".env"
-        ]
-        for env_path in env_paths:
-            if env_path.exists():
-                with open(env_path, 'r') as f:
-                    for line in f:
-                        line = line.strip()
-                        if line and not line.startswith('#') and '=' in line:
-                            key, value = line.split('=', 1)
-                            key = key.strip()
-                            value = value.strip().strip('"').strip("'")
-                            if key not in os.environ:
-                                os.environ[key] = value
-                break
-    load_env_manual()
+    load_dotenv()
+except Exception:
+    pass
 
+# ============================================================
+# 基础枚举与输入结构
+# ============================================================
 
 class AgeMode(Enum):
-    """年龄模式"""
-    TODDLER = "toddler"  # 5岁以下
-    KIDS = "kids"        # 6岁及以上
+    TODDLER = "toddler"
+    KIDS = "kids"
+
+
+class Orientation(Enum):
+    PORTRAIT = "portrait"
+    LANDSCAPE = "landscape"
+    AUTO = "auto"
 
 
 @dataclass
-class SceneInput:
-    """场景输入结构 - 4个核心变量"""
-    subject: str                           # 物体/主体 (谁/什么)
-    location: str                          # 地点 (在哪里)
-    action: str                            # 动作 (做什么)
-    age_mode: AgeMode = AgeMode.KIDS       # 年龄模式
+class IdeaInput:
+    """单输入 idea 模式"""
+    idea: str
+    age_mode: AgeMode = AgeMode.KIDS
+    orientation: Orientation = Orientation.AUTO
 
+# ============================================================
+# Prompt System（融合版，生产级）
+# ============================================================
 
 class ColoringPromptSystem:
     """
-    专业儿童涂色卡提示词系统
-
-    架构:
-    SYSTEM PROMPT  → 固定
-    USER PROMPT    → Text 或 Image 模板 + 年龄模式
-
-    只控制 4 个变量:
-    1. Subject（谁 / 什么）
-    2. Location（在哪里）
-    3. Action（做什么）
-    4. Age Mode（≤5 / ≥6）
+    Prompt 架构：
+      - system_prompt 固定：质量/印刷/安全底线
+      - user_prompt 动态：idea + age + orientation
     """
 
-    # ================================================================
-    # 系统提示词 - 固定不变
-    # ================================================================
-    SYSTEM_PROMPT = """[ROLE]
-You are a highly experienced professional children's coloring book illustrator
-and print design expert.
+    SYSTEM_PROMPT = """You are a professional children's coloring book illustrator
+specialized in creating print-ready black-and-white coloring pages
+that children love to color.
 
-You specialize in creating high-quality, printable black-and-white coloring
-pages for children of different age groups.
+Your mission is to combine imagination, beauty, and clarity,
+while ALWAYS keeping the artwork easy to color and safe to print.
 
-[CORE PRIORITY]
-Real-world usability for children > Printability > Artistic complexity
+PRIORITY ORDER:
+1. Child usability and enjoyment
+2. Print safety and clarity
+3. Visual appeal and imagination
 
-In all situations, the result must be:
-- Easy to color
-- Safe from color bleeding
-- Ready for direct printing
+MANDATORY LINE & PRINT RULES:
+- Pure black outlines on a pure white background only
+- Clean, smooth, continuous lines
+- All shapes and regions must be fully closed
+- Uniform line thickness throughout the entire illustration
+- No filled black areas, no shading, no gradients, no textures
+- No overlapping, tangled, or doubled lines
+- No tiny gaps, thin corridors, or cramped spaces
+- No text, letters, numbers, logos, or symbols
 
-[HARD RULES — MUST FOLLOW]
+DESIGN & COLORING USABILITY:
+- All coloring areas must be large and comfortable to fill
+- Prefer rounded, friendly shapes over sharp or narrow ones
+- Maintain clear spacing between separate objects
+- Every enclosed region must be safely colorable on its own
 
-1. Line Quality and Structure
-- All lines must be clean, smooth, and continuous
-- All outlines must be fully closed with no gaps of any kind
-- Line thickness must be uniform throughout the entire image
-- No double lines, no overlapping strokes, no dashed lines
-- Line intersections must be clear single-point intersections
-  (T-junction or clean cross only)
+ARTISTIC & IMAGINATION DIRECTION:
+- Cheerful, playful, and storybook-like mood
+- Friendly characters with simple, expressive faces
+- Whimsical and magical feeling created through composition,
+  not through excessive detail
+- Scenes should invite curiosity, joy, and gentle imagination
+- Visual richness must remain clean, open, and uncluttered
 
-2. Fill and Shading
-- Black outlines on a pure white background only
-- No solid black areas or filled regions
-- No grayscale, shadows, gradients, or textures
-- Dark-colored objects must be represented using outlines only
-- Eyes and small details must be simple dots or minimal shapes
+COMPOSITION & LAYOUT:
+- Balanced, harmonious page composition
+- Clear white margins suitable for printing
+- Illustration should naturally fill the page without empty corners
+- Overall style should resemble high-quality professional children's coloring books
 
-3. Shape Design and Complexity
-- All shapes must be simplified and child-friendly
-- Each coloring area must be large enough for comfortable coloring
-- Prefer rounded, smooth shapes over sharp or narrow ones
-- Avoid tiny gaps, thin corridors, or decorative micro-details
-
-4. Layout and Output Format
-- Page composition must match A4 print proportions
-- Layout must be centered and well-balanced
-- Clear white margins must be preserved around the page
-- Background must be pure white
-- Overall style must resemble clean vector line art
-  found in professional children's coloring books
-
-[FORBIDDEN ELEMENTS]
-- Any text, letters, or numbers
-- Logos, watermarks, or signatures
-- Color, grayscale, transparency
-- Photorealistic details or complex textures
-
-[SELF-CHECK BEFORE FINAL OUTPUT]
-Before finalizing, ensure:
-- Every enclosed region can be safely colored independently
-- No broken lines or open shapes exist
-- No dark filled areas appear
+FINAL SELF-CHECK BEFORE OUTPUT:
+- Every outline is closed and continuous
+- No dark or filled regions appear
 - Line weight is consistent and print-friendly
-- Overall complexity matches the target age group"""
+- Complexity matches the target age group
+- The page is ready for direct printing and enjoyable coloring
+"""
 
-    # ================================================================
-    # 年龄模式提示词
-    # ================================================================
     AGE_MODE_PROMPTS = {
-        AgeMode.TODDLER: """[AGE MODE: TODDLER / PRESCHOOL — UNDER 5]
+        AgeMode.TODDLER: """[AGE MODE: TODDLER / PRESCHOOL]
+Target complexity: VERY LOW
+- 3–5 friendly objects maximum
+- Extra-large, open coloring areas
+- Thick, bold outlines
+- Wide spacing between all elements
+- Instantly recognizable subjects
 
-- Use very large and simple shapes
-- Minimize the number of objects
-- Avoid small enclosed areas
-- Use bold, rounded forms
-- Keep the scene extremely clear and easy to understand""",
+Imagination style:
+Soft, comforting, and friendly.
+Think smiling suns, fluffy clouds,
+cute animals with big eyes and simple shapes.
+""",
+        AgeMode.KIDS: """[AGE MODE: KIDS]
+Target complexity: MODERATE
+- 5–10 clear objects
+- Medium to large coloring areas
+- Simple decorative elements allowed
+- Light background scenery for storytelling
+- Characters may show action and emotion
 
-        AgeMode.KIDS: """[AGE MODE: KIDS — 6 YEARS OLD AND ABOVE]
-
-- Use moderately large coloring areas
-- Allow a moderate level of detail
-- Clearly separate different objects
-- Keep the design clean and readable
-- Avoid excessive complexity or tiny patterns"""
+Imagination style:
+Playful and adventurous.
+Think secret gardens, tree houses,
+underwater worlds, friendly dragons,
+and gentle magical scenes.
+Decorative details must remain large and simple.
+"""
     }
 
-    # ================================================================
-    # 用户提示词模板 - 文本生成涂色卡
-    # ================================================================
-    TEXT_TO_COLORING_TEMPLATE = """Create a children's coloring page based on the following description.
+    ORIENTATION_PROMPTS = {
+        Orientation.PORTRAIT: """VERTICAL COMPOSITION:
+- Tall, storybook-style layout
+- Sky elements near the top
+- Ground elements near the bottom
+- Let the scene flow naturally from top to bottom
+""",
+        Orientation.LANDSCAPE: """HORIZONTAL COMPOSITION:
+- Wide, panoramic layout
+- Spread elements evenly from left to right
+- Avoid crowded or compressed areas
+""",
+        Orientation.AUTO: """AUTO COMPOSITION:
+- Naturally fill the entire page
+- Extend the scene with simple environment elements
+- No empty corners, no clutter
+"""
+    }
 
-Subject:
-{subject}
+    IDEA_TO_COLORING_TEMPLATE = """Create a children's coloring page based on this idea:
 
-Location:
-{location}
-
-Action:
-{action}
+{idea}
 
 {age_mode_prompt}
 
-[STYLE REQUIREMENTS]
-- Black and white line art only
-- Clean, closed outlines
-- Uniform line thickness
-- Vector-style illustration
-- No shading, no color, no filled areas
+COMPOSITION:
+{orientation_prompt}
 
-[PAGE FORMAT]
-- A4 printable layout
-- Automatically choose portrait or landscape orientation
-- Centered composition with clear margins
+The illustration should feel joyful, imaginative,
+and visually pleasing for children.
 
-The final result must look like a professional children's coloring book page
-that is easy, safe, and enjoyable for children to color."""
+Ensure the result is print-ready and easy to color.
+"""
 
-    # ================================================================
-    # 用户提示词模板 - 图片转涂色卡
-    # ================================================================
     IMAGE_TO_COLORING_TEMPLATE = """Convert the provided image into a children's coloring book page.
 
 IMPORTANT:
-Do NOT trace the image directly.
-Redraw it as simplified, clean vector-style line art suitable for children.
+Do NOT trace or outline the image directly.
+Redraw the scene as simplified, child-friendly line art.
+
+GOALS:
+- Preserve the main subject and overall idea of the image
+- Reinterpret the scene with imagination and warmth
+- Make the illustration enjoyable and easy for children to color
 
 {age_mode_prompt}
 
-[REQUIRED TRANSFORMATION RULES]
-- Simplify all shapes
-- Close all outlines completely
-- Remove unnecessary details
-- Fix any broken or overlapping lines
-- Eliminate all shading, textures, and filled areas
+TRANSFORMATION RULES:
+- Simplify all shapes into rounded, friendly forms
+- Remove all textures, shadows, lighting effects, and gradients
+- Eliminate unnecessary or confusing details
+- Ensure all outlines are clean, smooth, and fully closed
+- Keep line thickness uniform throughout the illustration
+- Avoid overlapping lines, tight spaces, or tiny decorative details
+- All coloring areas must be large and comfortable to fill
 
-[OUTPUT REQUIREMENTS]
-- Black outlines on a pure white background
-- Uniform line thickness
-- A4 printable layout
-- Clean, child-friendly composition
+COMPOSITION:
+{orientation_prompt}
 
-The final result must be a high-quality children's coloring page
-that can be printed and colored safely without color bleeding."""
+FINAL REQUIREMENTS:
+- Black outlines on a pure white background only
+- No filled black areas, no shading, no grayscale
+- No text, letters, numbers, logos, or symbols
+- The result must be print-ready and safe for children to color
+"""
 
-    # ================================================================
-    # 中文词汇翻译映射
-    # ================================================================
-    SUBJECT_MAPPINGS = {
-        # 动物类
-        "小猫": "a cute little kitten",
-        "猫": "a cat",
-        "小狗": "a cute puppy",
-        "狗": "a dog",
-        "兔子": "a rabbit",
-        "小兔子": "a baby bunny",
-        "熊猫": "a panda bear",
-        "小熊": "a teddy bear",
-        "小鸟": "a little bird",
-        "蝴蝶": "a butterfly",
-        "小鱼": "a fish",
-        "小马": "a pony",
-        "独角兽": "a unicorn",
-        "恐龙": "a friendly dinosaur",
-        "小象": "a baby elephant",
-        "小狮子": "a lion cub",
-        "长颈鹿": "a giraffe",
-        "猴子": "a monkey",
-        "企鹅": "a penguin",
-        "海豚": "a dolphin",
-        "乌龟": "a turtle",
-        "瓢虫": "a ladybug",
-        "蜜蜂": "a bee",
-        "蜗牛": "a snail",
-        "青蛙": "a frog",
-        "螃蟹": "a crab",
-        "章鱼": "an octopus",
-        "老虎": "a tiger",
-        "斑马": "a zebra",
-        "考拉": "a koala",
-
-        # 人物类
-        "小女孩": "a little girl",
-        "小男孩": "a little boy",
-        "公主": "a princess",
-        "王子": "a prince",
-        "仙女": "a fairy",
-        "小朋友": "a child",
-        "宝宝": "a baby",
-        "超人": "a superhero",
-        "海盗": "a pirate",
-        "宇航员": "an astronaut",
-        "消防员": "a firefighter",
-        "医生": "a doctor",
-        "老师": "a teacher",
-        "厨师": "a chef",
-
-        # 交通工具
-        "汽车": "a car",
-        "火车": "a train",
-        "飞机": "an airplane",
-        "轮船": "a boat",
-        "火箭": "a rocket",
-        "自行车": "a bicycle",
-        "公交车": "a bus",
-        "消防车": "a fire truck",
-        "挖掘机": "an excavator",
-        "直升机": "a helicopter",
-        "热气球": "a hot air balloon",
-
-        # 其他
-        "房子": "a house",
-        "城堡": "a castle",
-        "花": "a flower",
-        "树": "a tree",
-        "太阳": "the sun",
-        "月亮": "the moon",
-        "星星": "stars",
-        "彩虹": "a rainbow",
-        "蛋糕": "a birthday cake",
-        "气球": "balloons",
-        "风筝": "a kite",
-        "雪人": "a snowman",
-        "圣诞树": "a Christmas tree",
-    }
-
-    LOCATION_MAPPINGS = {
-        "花园里": "in a garden",
-        "花园中": "in a garden",
-        "公园里": "in a park",
-        "公园中": "in a park",
-        "森林里": "in a forest",
-        "森林中": "in a forest",
-        "草地上": "on a meadow",
-        "河边": "by the river",
-        "湖边": "near a lake",
-        "海边": "at the beach",
-        "沙滩上": "on the beach",
-        "山上": "on a mountain",
-        "天空中": "in the sky",
-        "云朵上": "on the clouds",
-        "房间里": "in a room",
-        "卧室里": "in a bedroom",
-        "厨房里": "in a kitchen",
-        "客厅里": "in a living room",
-        "学校里": "at school",
-        "操场上": "on a playground",
-        "农场里": "on a farm",
-        "动物园里": "at the zoo",
-        "游乐园里": "at an amusement park",
-        "城堡里": "in a castle",
-        "太空中": "in outer space",
-        "水里": "underwater",
-        "海底": "under the sea",
-        "雪地上": "in the snow",
-        "游泳池里": "in a swimming pool",
-        "马路上": "on the street",
-        "树上": "in a tree",
-        "花丛中": "among the flowers",
-        "田野里": "in a field",
-        "竹林里": "in a bamboo forest",
-    }
-
-    ACTION_MAPPINGS = {
-        "追蝴蝶": "chasing butterflies",
-        "玩球": "playing with a ball",
-        "读书": "reading a book",
-        "唱歌": "singing",
-        "跳舞": "dancing",
-        "画画": "painting",
-        "吃东西": "eating",
-        "睡觉": "sleeping",
-        "跑步": "running",
-        "游泳": "swimming",
-        "飞翔": "flying",
-        "骑车": "riding a bicycle",
-        "荡秋千": "swinging on a swing",
-        "放风筝": "flying a kite",
-        "堆沙堡": "building a sandcastle",
-        "摘花": "picking flowers",
-        "浇花": "watering flowers",
-        "钓鱼": "fishing",
-        "野餐": "having a picnic",
-        "过生日": "celebrating a birthday",
-        "开派对": "having a party",
-        "做游戏": "playing games",
-        "拥抱": "hugging",
-        "微笑": "smiling",
-        "看星星": "looking at the stars",
-        "赏月": "watching the moon",
-        "滑滑梯": "sliding down a slide",
-        "爬树": "climbing a tree",
-        "吹泡泡": "blowing bubbles",
-        "吃冰淇淋": "eating ice cream",
-        "吃竹子": "eating bamboo",
-        "喝水": "drinking water",
-        "追逐": "chasing",
-        "玩耍": "playing",
-        "散步": "taking a walk",
-        "跳跃": "jumping",
-        "挖沙子": "digging in the sand",
-        "堆雪人": "building a snowman",
-        "滑雪": "skiing",
-        "溜冰": "ice skating",
-    }
-
-    def __init__(self):
-        pass
-
-    def _translate_element(self, text: str, mapping: dict) -> str:
-        """翻译单个元素"""
-        if not text:
-            return ""
-
-        # 精确匹配
-        if text in mapping:
-            return mapping[text]
-
-        # 部分匹配
-        for key, value in mapping.items():
-            if key in text:
-                return value
-
-        # 无匹配时返回原文
-        return text
-
-    def get_system_prompt(self) -> str:
-        """获取系统提示词（固定）"""
-        return self.SYSTEM_PROMPT
-
-    def build_text_to_coloring_prompt(self, scene: SceneInput) -> str:
-        """
-        构建文本生成涂色卡的用户提示词
-
-        Args:
-            scene: 包含 subject, location, action, age_mode 的场景输入
-
-        Returns:
-            str: 完整的用户提示词
-        """
-        # 翻译各个元素
-        subject_en = self._translate_element(scene.subject, self.SUBJECT_MAPPINGS)
-        location_en = self._translate_element(scene.location, self.LOCATION_MAPPINGS)
-        action_en = self._translate_element(scene.action, self.ACTION_MAPPINGS)
-
-        # 获取年龄模式提示词
-        age_mode_prompt = self.AGE_MODE_PROMPTS[scene.age_mode]
-
-        # 填充模板
-        user_prompt = self.TEXT_TO_COLORING_TEMPLATE.format(
-            subject=subject_en,
-            location=location_en,
-            action=action_en,
-            age_mode_prompt=age_mode_prompt
+    def build_text_prompts(self, idea_input: IdeaInput) -> Dict[str, Any]:
+        user_prompt = self.IDEA_TO_COLORING_TEMPLATE.format(
+            idea=idea_input.idea.strip(),
+            age_mode_prompt=self.AGE_MODE_PROMPTS[idea_input.age_mode],
+            orientation_prompt=self.ORIENTATION_PROMPTS[idea_input.orientation],
         )
-
-        return user_prompt
-
-    def build_image_to_coloring_prompt(self, age_mode: AgeMode = AgeMode.KIDS) -> str:
-        """
-        构建图片转涂色卡的用户提示词
-
-        Args:
-            age_mode: 年龄模式
-
-        Returns:
-            str: 完整的用户提示词
-        """
-        age_mode_prompt = self.AGE_MODE_PROMPTS[age_mode]
-
-        user_prompt = self.IMAGE_TO_COLORING_TEMPLATE.format(
-            age_mode_prompt=age_mode_prompt
-        )
-
-        return user_prompt
-
-    def get_full_prompts(self, scene: SceneInput, mode: str = "text") -> dict:
-        """
-        获取完整的提示词组合
-
-        Args:
-            scene: 场景输入
-            mode: "text" 文生图 或 "image" 图生图
-
-        Returns:
-            dict: 包含 system_prompt 和 user_prompt
-        """
-        system_prompt = self.get_system_prompt()
-
-        if mode == "text":
-            user_prompt = self.build_text_to_coloring_prompt(scene)
-        else:
-            user_prompt = self.build_image_to_coloring_prompt(scene.age_mode)
-
         return {
-            "system_prompt": system_prompt,
+            "system_prompt": self.SYSTEM_PROMPT,
             "user_prompt": user_prompt,
-            "age_mode": scene.age_mode.value,
-            "original_input": {
-                "subject": scene.subject,
-                "location": scene.location,
-                "action": scene.action
+            "meta": {
+                "mode": "text",
+                "age_mode": idea_input.age_mode.value,
+                "orientation": idea_input.orientation.value,
+                "idea": idea_input.idea,
             }
         }
 
+    def build_image_prompts(self, age_mode: AgeMode, orientation: Orientation) -> Dict[str, Any]:
+        user_prompt = self.IMAGE_TO_COLORING_TEMPLATE.format(
+            age_mode_prompt=self.AGE_MODE_PROMPTS[age_mode],
+            orientation_prompt=self.ORIENTATION_PROMPTS[orientation],
+        )
+        return {
+            "system_prompt": self.SYSTEM_PROMPT,
+            "user_prompt": user_prompt,
+            "meta": {
+                "mode": "image",
+                "age_mode": age_mode.value,
+                "orientation": orientation.value,
+            }
+        }
+
+# ============================================================
+# OpenRouter Generator（system/user 分离）
+# ============================================================
 
 class OpenRouterImageGenerator:
     """
     OpenRouter 图像生成器
-    支持多种文生图模型
+    - 所有请求走 /chat/completions
+    - messages: system + user 分离
     """
 
-    # OpenRouter 支持的图像生成模型
-    # 通过 API 查询获取: GET https://openrouter.ai/api/v1/models
     SUPPORTED_MODELS = {
-        # OpenAI GPT 图像系列
         "gpt5-image": "openai/gpt-5-image",
         "gpt5-image-mini": "openai/gpt-5-image-mini",
-
-        # Google Gemini 图像系列 (推荐)
         "gemini-image": "google/gemini-2.5-flash-image",
-        "gemini-image-preview": "google/gemini-2.5-flash-image-preview",
-        "gemini3-image": "google/gemini-3-pro-image-preview",
-
-        # 默认推荐 (Gemini 速度快，效果好)
-        "default": "google/gemini-2.5-flash-image",
+        "nano-banana-pro": "google/gemini-3-pro-image-preview",
+        "default": "openai/gpt-5-image-mini",
     }
 
-    def __init__(self, api_key: Optional[str] = None):
+    def __init__(self, api_key: Optional[str] = None, base_url: str = "https://openrouter.ai/api/v1"):
         self.api_key = api_key or os.getenv("OPENROUTER_API_KEY")
         if not self.api_key:
             raise ValueError("请设置 OPENROUTER_API_KEY 环境变量或传入 api_key 参数")
-
-        self.base_url = "https://openrouter.ai/api/v1"
+        self.base_url = base_url
         self.prompt_system = ColoringPromptSystem()
 
-    def generate_from_text(
+    def generate_from_idea(
         self,
-        scene: SceneInput,
-        model: str = "gemini-image",
-        width: int = 1024,
-        height: int = 1448,  # A4 比例
-        save_path: Optional[str] = None
-    ) -> dict:
-        """
-        文本生成涂色卡
-
-        Args:
-            scene: 场景输入 (subject, location, action, age_mode)
-            model: 模型名称
-            width: 图像宽度
-            height: 图像高度 (默认 A4 比例)
-            save_path: 保存路径
-        """
-        prompts = self.prompt_system.get_full_prompts(scene, mode="text")
-        return self._generate(prompts, model, width, height, save_path)
+        idea_input: IdeaInput,
+        model: str,
+        save_path: str,
+        timeout_sec: int = 180,
+        retry: int = 1,
+    ) -> Dict[str, Any]:
+        prompts = self.prompt_system.build_text_prompts(idea_input)
+        return self._generate(
+            prompts=prompts,
+            model=model,
+            save_path=save_path,
+            timeout_sec=timeout_sec,
+            retry=retry,
+            image_path=None,
+        )
 
     def generate_from_image(
         self,
         image_path: str,
-        age_mode: AgeMode = AgeMode.KIDS,
-        model: str = "gemini-image",
-        width: int = 1024,
-        height: int = 1448,
-        save_path: Optional[str] = None
-    ) -> dict:
-        """
-        图片转涂色卡
-
-        Args:
-            image_path: 源图片路径
-            age_mode: 年龄模式
-            model: 模型名称
-            width: 输出宽度
-            height: 输出高度
-            save_path: 保存路径
-        """
-        scene = SceneInput(subject="", location="", action="", age_mode=age_mode)
-        prompts = self.prompt_system.get_full_prompts(scene, mode="image")
-        prompts["source_image"] = image_path
-
-        return self._generate(prompts, model, width, height, save_path, image_path)
+        age_mode: AgeMode,
+        orientation: Orientation,
+        model: str,
+        save_path: str,
+        timeout_sec: int = 180,
+        retry: int = 1,
+    ) -> Dict[str, Any]:
+        prompts = self.prompt_system.build_image_prompts(age_mode, orientation)
+        return self._generate(
+            prompts=prompts,
+            model=model,
+            save_path=save_path,
+            timeout_sec=timeout_sec,
+            retry=retry,
+            image_path=image_path,
+        )
 
     def _generate(
         self,
-        prompts: dict,
+        prompts: Dict[str, Any],
         model: str,
-        width: int,
-        height: int,
-        save_path: Optional[str],
-        image_path: Optional[str] = None
-    ) -> dict:
-        """执行图像生成"""
+        save_path: str,
+        timeout_sec: int,
+        retry: int,
+        image_path: Optional[str],
+    ) -> Dict[str, Any]:
         model_id = self.SUPPORTED_MODELS.get(model, model)
 
+        endpoint = f"{self.base_url}/chat/completions"
         headers = {
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json",
             "HTTP-Referer": "https://coloring-generator.local",
-            "X-Title": "Children Coloring Page Generator"
+            "X-Title": "Children Coloring Page Generator v2",
         }
 
-        # OpenRouter 所有模型都通过 chat/completions endpoint
-        endpoint = f"{self.base_url}/chat/completions"
-        payload = self._build_payload(prompts, model_id, width, height, image_path)
+        payload = self._build_payload(prompts, model_id, image_path=image_path)
 
-        self._print_generation_info(prompts, model_id)
-
-        try:
-            response = requests.post(endpoint, headers=headers, json=payload, timeout=180)
-            response.raise_for_status()
-            result = response.json()
-
-            image_data = self._extract_image(result, model_id)
-
-            if save_path and image_data:
-                self._save_image(image_data, save_path)
-                print(f"\n图像已保存至: {save_path}")
-
-            return {
-                "success": True,
-                "prompts": prompts,
-                "model": model_id,
-                "image_data": image_data,
-                "save_path": save_path,
-                "raw_response": result
-            }
-
-        except requests.exceptions.RequestException as e:
-            error_msg = str(e)
-            # 尝试获取更详细的错误信息
+        t0 = time.time()
+        last_err = None
+        for attempt in range(retry + 1):
             try:
-                if hasattr(e, 'response') and e.response is not None:
-                    error_detail = e.response.json()
-                    error_msg = f"{error_msg}\n详细: {json.dumps(error_detail, ensure_ascii=False)}"
-            except:
-                pass
-            return {
-                "success": False,
-                "error": error_msg,
-                "prompts": prompts,
-                "model": model_id
-            }
+                resp = requests.post(endpoint, headers=headers, json=payload, timeout=timeout_sec)
+                resp.raise_for_status()
+                result = resp.json()
 
-    def _build_payload(
-        self,
-        prompts: dict,
-        model_id: str,
-        width: int,
-        height: int,
-        image_path: Optional[str] = None
-    ) -> dict:
-        """构建 OpenRouter API 请求体"""
+                image_data = self._extract_image(result)
+                if not image_data:
+                    raise RuntimeError("模型未返回图像数据（message.images / data URL 为空）")
 
-        # 合并 system prompt 和 user prompt 作为完整提示
-        full_prompt = f"{prompts['system_prompt']}\n\n{prompts['user_prompt']}"
-
-        # 构建消息
-        messages = [
-            {"role": "user", "content": full_prompt}
-        ]
-
-        # 如果是图生图，添加图片
-        if image_path:
-            with open(image_path, "rb") as f:
-                image_b64 = base64.b64encode(f.read()).decode()
-            # 获取图片类型
-            ext = Path(image_path).suffix.lower()
-            mime_type = {
-                ".jpg": "image/jpeg",
-                ".jpeg": "image/jpeg",
-                ".png": "image/png",
-                ".gif": "image/gif",
-                ".webp": "image/webp"
-            }.get(ext, "image/png")
-
-            messages = [
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "image_url",
-                            "image_url": {
-                                "url": f"data:{mime_type};base64,{image_b64}"
-                            }
-                        },
-                        {
-                            "type": "text",
-                            "text": full_prompt
-                        }
-                    ]
+                self._save_image(image_data, save_path)
+                return {
+                    "success": True,
+                    "model": model_id,
+                    "elapsed_sec": round(time.time() - t0, 3),
+                    "save_path": save_path,
+                    "meta": prompts.get("meta", {}),
+                    "user_prompt_preview": prompts["user_prompt"][:500],
+                    "raw_response": result,
                 }
-            ]
 
-        payload = {
+            except Exception as e:
+                last_err = str(e)
+                if attempt < retry:
+                    time.sleep(1.2 * (attempt + 1))
+                continue
+
+        return {
+            "success": False,
             "model": model_id,
-            "messages": messages,
+            "elapsed_sec": round(time.time() - t0, 3),
+            "error": last_err,
+            "meta": prompts.get("meta", {}),
+            "user_prompt_preview": prompts["user_prompt"][:500],
         }
 
-        # 根据模型类型添加特定参数
-        if "flux" in model_id.lower():
-            # Flux 模型的图像参数
-            payload["provider"] = {
-                "sort": "throughput"
-            }
-            # 图像尺寸通过 prompt 指定或使用默认
+    def _build_payload(self, prompts: Dict[str, Any], model_id: str, image_path: Optional[str]) -> Dict[str, Any]:
+        # ✅ system/user 分离
+        system_msg = {"role": "system", "content": prompts["system_prompt"]}
 
-        elif "dall-e" in model_id.lower():
-            # DALL-E 特定参数
-            if height > width:
-                size = "1024x1792"
-            elif width > height:
-                size = "1792x1024"
-            else:
-                size = "1024x1024"
-            payload["size"] = size
-            payload["quality"] = "standard"
+        if image_path:
+            # 图生图：user content 为多段（image + text）
+            image_b64, mime_type = self._load_image_as_data_url(image_path)
+            user_msg = {
+                "role": "user",
+                "content": [
+                    {"type": "image_url", "image_url": {"url": image_b64}},
+                    {"type": "text", "text": prompts["user_prompt"]},
+                ],
+            }
+        else:
+            user_msg = {"role": "user", "content": prompts["user_prompt"]}
+
+        payload: Dict[str, Any] = {
+            "model": model_id,
+            "messages": [system_msg, user_msg],
+        }
+
+        # 尺寸策略：按模型原生参数（保持你之前策略）
+        if "gemini" in model_id.lower():
+            payload["image_config"] = {"aspect_ratio": "2:3", "image_size": "2K"}
+        else:
+            payload["size"] = "1024x1536"
+            payload["quality"] = "high"
 
         return payload
 
-    def _extract_image(self, result: dict, model_id: str) -> Optional[str]:
-        """提取图像数据"""
+    def _load_image_as_data_url(self, image_path: str) -> (str, str):
+        ext = Path(image_path).suffix.lower()
+        mime_type = {
+            ".jpg": "image/jpeg",
+            ".jpeg": "image/jpeg",
+            ".png": "image/png",
+            ".gif": "image/gif",
+            ".webp": "image/webp",
+        }.get(ext, "image/png")
+
+        with open(image_path, "rb") as f:
+            b64 = base64.b64encode(f.read()).decode("utf-8")
+
+        return f"data:{mime_type};base64,{b64}", mime_type
+
+    def _extract_image(self, result: Dict[str, Any]) -> Optional[str]:
         try:
-            # OpenRouter 返回格式
             choices = result.get("choices", [])
-            if choices:
-                message = choices[0].get("message", {})
+            if not choices:
+                return None
+            msg = choices[0].get("message", {})
 
-                # Gemini 图像模型: 图像在 message.images 数组中
-                images = message.get("images", [])
-                if images:
-                    first_image = images[0]
-                    if isinstance(first_image, dict):
-                        image_url = first_image.get("image_url", {})
-                        url = image_url.get("url", "")
-                        if url:
-                            return url
-                    elif isinstance(first_image, str):
-                        return first_image
+            images = msg.get("images", [])
+            if images:
+                first = images[0]
+                if isinstance(first, dict):
+                    url = first.get("image_url", {}).get("url")
+                    if url:
+                        return url
+                elif isinstance(first, str):
+                    return first
 
-                # 检查 content 字段
-                content = message.get("content", "")
+            content = msg.get("content", "")
+            if isinstance(content, str) and (content.startswith("http") or content.startswith("data:image")):
+                return content
 
-                # 检查是否是 URL
-                if content and content.startswith("http"):
-                    return content
-
-                # 检查是否包含 markdown 图片链接
-                if content:
-                    import re
-                    url_match = re.search(r'!\[.*?\]\((https?://[^\)]+)\)', content)
-                    if url_match:
-                        return url_match.group(1)
-
-                    # 检查是否是 base64 data URL
-                    if content.startswith("data:image"):
-                        return content
-
-            # 旧格式兼容
-            data = result.get("data", [{}])
-            if data:
-                return data[0].get("b64_json") or data[0].get("url")
-
-        except (IndexError, KeyError) as e:
-            print(f"提取图像失败: {e}")
+            return None
+        except Exception:
             return None
 
-    def _save_image(self, image_data: str, save_path: str):
-        """保存图像"""
-        os.makedirs(os.path.dirname(save_path) or ".", exist_ok=True)
+    def _save_image(self, image_data: str, save_path: str) -> None:
+        Path(save_path).parent.mkdir(parents=True, exist_ok=True)
 
         if image_data.startswith("http"):
-            # URL 格式
-            response = requests.get(image_data, timeout=60)
-            with open(save_path, "wb") as f:
-                f.write(response.content)
+            r = requests.get(image_data, timeout=60)
+            r.raise_for_status()
+            raw = r.content
         elif image_data.startswith("data:image"):
-            # data URL 格式: data:image/png;base64,XXXX
-            # 提取 base64 部分
-            if "," in image_data:
-                base64_data = image_data.split(",", 1)[1]
-            else:
-                base64_data = image_data
-            with open(save_path, "wb") as f:
-                f.write(base64.b64decode(base64_data))
+            b64 = image_data.split(",", 1)[1] if "," in image_data else image_data
+            raw = base64.b64decode(b64)
         else:
-            # 纯 base64 格式
-            with open(save_path, "wb") as f:
-                f.write(base64.b64decode(image_data))
+            raw = base64.b64decode(image_data)
 
-    def _print_generation_info(self, prompts: dict, model_id: str):
-        """打印生成信息"""
-        print(f"\n{'='*70}")
-        print(f"儿童涂色卡生成器")
-        print(f"{'='*70}")
-
-        if prompts.get("original_input"):
-            orig = prompts["original_input"]
-            print(f"输入: {orig['subject']} 在 {orig['location']} {orig['action']}")
-
-        print(f"年龄模式: {prompts['age_mode']}")
-        print(f"模型: {model_id}")
-        print(f"{'─'*70}")
-        print(f"[USER PROMPT 预览]")
-        print(prompts["user_prompt"][:500])
-        if len(prompts["user_prompt"]) > 500:
-            print("...")
-        print(f"{'='*70}")
-
-
-def parse_chinese_input(text: str, age_mode: AgeMode = AgeMode.KIDS) -> SceneInput:
-    """
-    解析中文输入
-
-    格式: 物体 在 某某地方 做什么
-    示例: 小猫 在 花园里 追蝴蝶
-    """
-    subject = ""
-    location = ""
-    action = ""
-
-    if " 在 " in text:
-        parts = text.split(" 在 ", 1)
-        subject = parts[0].strip()
-        rest = parts[1].strip()
-
-        # 查找地点后缀
-        location_suffixes = ["里", "中", "上", "边", "间", "外", "下", "旁"]
-
-        for i, char in enumerate(rest):
-            if char in location_suffixes:
-                location = rest[:i+1].strip()
-                action = rest[i+1:].strip()
-                break
-
-        if not location:
-            parts = rest.split(" ", 1)
-            location = parts[0]
-            action = parts[1] if len(parts) > 1 else ""
-    else:
-        parts = text.split()
-        if len(parts) >= 3:
-            subject = parts[0]
-            location = parts[1]
-            action = " ".join(parts[2:])
-        elif len(parts) == 2:
-            subject = parts[0]
-            action = parts[1]
-        else:
-            subject = text
-
-    return SceneInput(
-        subject=subject,
-        location=location,
-        action=action,
-        age_mode=age_mode
-    )
+        with open(save_path, "wb") as f:
+            f.write(raw)
 
 
 # ============================================================
-# 测试脚本
+# 批量测试集 & Runner
 # ============================================================
 
-def test_prompt_system():
-    """测试提示词系统"""
-    print("\n" + "="*70)
-    print("测试提示词系统")
-    print("="*70)
-
-    prompt_system = ColoringPromptSystem()
-
-    # 测试用例
-    test_cases = [
-        ("小猫 在 花园里 追蝴蝶", AgeMode.KIDS),
-        ("小女孩 在 公园中 荡秋千", AgeMode.TODDLER),
-        ("独角兽 在 云朵上 飞翔", AgeMode.KIDS),
-        ("恐龙 在 森林里 吃东西", AgeMode.TODDLER),
+def default_test_set() -> List[IdeaInput]:
+    return [
+        IdeaInput("A friendly dinosaur having a picnic in a sunny forest with butterflies", AgeMode.KIDS, Orientation.AUTO),
+        IdeaInput("A smiling teddy bear riding a tiny train through a flower garden", AgeMode.TODDLER, Orientation.AUTO),
+        IdeaInput("A magical underwater world with playful fish, a friendly octopus, and sea plants", AgeMode.KIDS, Orientation.PORTRAIT),
+        IdeaInput("A cute puppy flying a kite in a park with fluffy clouds", AgeMode.TODDLER, Orientation.PORTRAIT),
+        IdeaInput("A friendly dragon carefully watering a secret garden with big flowers", AgeMode.KIDS, Orientation.AUTO),
+        IdeaInput("A happy robot helping animals build a tree house", AgeMode.KIDS, Orientation.AUTO),
+        IdeaInput("A little cat exploring a pumpkin village with cozy houses", AgeMode.KIDS, Orientation.PORTRAIT),
+        IdeaInput("A smiling sun and a rainbow over a field with simple flowers", AgeMode.TODDLER, Orientation.PORTRAIT),
     ]
 
-    for text, age_mode in test_cases:
-        scene = parse_chinese_input(text, age_mode)
-        prompts = prompt_system.get_full_prompts(scene, mode="text")
 
-        print(f"\n{'─'*70}")
-        print(f"输入: {text}")
-        print(f"年龄模式: {age_mode.value}")
-        print(f"\n[解析结果]")
-        print(f"  Subject: {scene.subject} -> {prompt_system._translate_element(scene.subject, prompt_system.SUBJECT_MAPPINGS)}")
-        print(f"  Location: {scene.location} -> {prompt_system._translate_element(scene.location, prompt_system.LOCATION_MAPPINGS)}")
-        print(f"  Action: {scene.action} -> {prompt_system._translate_element(scene.action, prompt_system.ACTION_MAPPINGS)}")
-        print(f"\n[USER PROMPT]")
-        print(prompts["user_prompt"])
+def run_batch(gen: OpenRouterImageGenerator, cases: List[IdeaInput], model: str, out_dir: str, retry: int) -> Dict[str, Any]:
+    Path(out_dir).mkdir(parents=True, exist_ok=True)
+    results: List[Dict[str, Any]] = []
 
-    print("\n" + "="*70)
+    for idx, idea_input in enumerate(cases, start=1):
+        ts = time.strftime("%Y%m%d_%H%M%S")
+        stem = f"{idx:03d}_{idea_input.age_mode.value}_{idea_input.orientation.value}_{ts}"
+        png_path = str(Path(out_dir) / f"{stem}.png")
+        json_path = str(Path(out_dir) / f"{stem}.json")
 
+        print(f"\n[{idx}/{len(cases)}] model={model} age={idea_input.age_mode.value} orient={idea_input.orientation.value}")
+        print(f"  idea: {idea_input.idea}")
 
-def test_system_prompt():
-    """显示系统提示词"""
-    print("\n" + "="*70)
-    print("系统提示词 (SYSTEM PROMPT) - 固定")
-    print("="*70)
-
-    prompt_system = ColoringPromptSystem()
-    print(prompt_system.get_system_prompt())
-
-    print("\n" + "="*70)
-
-
-def test_image_to_coloring():
-    """测试图生图提示词"""
-    print("\n" + "="*70)
-    print("测试图生图提示词")
-    print("="*70)
-
-    prompt_system = ColoringPromptSystem()
-
-    for age_mode in [AgeMode.TODDLER, AgeMode.KIDS]:
-        print(f"\n{'─'*70}")
-        print(f"年龄模式: {age_mode.value}")
-        print(f"\n[IMAGE TO COLORING PROMPT]")
-        print(prompt_system.build_image_to_coloring_prompt(age_mode))
-
-    print("\n" + "="*70)
-
-
-def test_full_generation(api_key: Optional[str] = None):
-    """测试完整生成流程"""
-    print("\n" + "="*70)
-    print("测试完整生成流程")
-    print("="*70)
-
-    if not api_key and not os.getenv("OPENROUTER_API_KEY"):
-        print("\n[跳过] 未设置 OPENROUTER_API_KEY")
-        print("请设置环境变量: export OPENROUTER_API_KEY='your-key'")
-        return
-
-    try:
-        generator = OpenRouterImageGenerator(api_key)
-
-        # 测试场景
-        scene = parse_chinese_input("小猫 在 花园里 追蝴蝶", AgeMode.KIDS)
-
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        save_path = f"output/coloring_{timestamp}.png"
-
-        result = generator.generate_from_text(
-            scene=scene,
-            model="gemini-image",  # 使用 Gemini 图像模型
-            save_path=save_path
+        res = gen.generate_from_idea(
+            idea_input=idea_input,
+            model=model,
+            save_path=png_path,
+            retry=retry,
         )
 
-        if result["success"]:
-            print(f"\n生成成功! 保存路径: {result['save_path']}")
+        with open(json_path, "w", encoding="utf-8") as f:
+            json.dump(res, f, ensure_ascii=False, indent=2)
+
+        if res["success"]:
+            print(f"  OK   -> {res['save_path']} ({res['elapsed_sec']}s)")
         else:
-            print(f"\n生成失败: {result['error']}")
+            print(f"  FAIL -> {res['error']} ({res['elapsed_sec']}s)")
+        results.append(res)
 
-    except Exception as e:
-        print(f"\n测试出错: {e}")
+    summary = {
+        "total": len(results),
+        "success": sum(1 for r in results if r.get("success")),
+        "failed": sum(1 for r in results if not r.get("success")),
+        "model": model,
+        "out_dir": out_dir,
+        "time": time.strftime("%Y-%m-%d %H:%M:%S"),
+    }
+
+    with open(str(Path(out_dir) / "_summary.json"), "w", encoding="utf-8") as f:
+        json.dump(summary, f, ensure_ascii=False, indent=2)
+
+    print("\n=== SUMMARY ===")
+    print(json.dumps(summary, ensure_ascii=False, indent=2))
+    return summary
 
 
-def interactive_mode():
-    """交互式模式"""
-    print("\n" + "="*70)
-    print("儿童涂色卡生成器 - 交互模式")
-    print("="*70)
-    print("\n输入格式: 物体 在 某某地方 做什么")
-    print("示例: 小猫 在 花园里 追蝴蝶")
-    print("\n命令:")
-    print("  toddler  - 切换到幼儿模式 (5岁以下)")
-    print("  kids     - 切换到儿童模式 (6岁及以上)")
-    print("  quit     - 退出")
-    print()
+# ============================================================
+# 交互模式（仅 idea）
+# ============================================================
 
-    prompt_system = ColoringPromptSystem()
-    current_age_mode = AgeMode.KIDS
+def interactive_mode(gen: OpenRouterImageGenerator, model: str, out_dir: str):
+    Path(out_dir).mkdir(parents=True, exist_ok=True)
+
+    age_mode = AgeMode.KIDS
+    orientation = Orientation.PORTRAIT
+
+    print("\n儿童涂色卡生成器 v2（单输入 idea）")
+    print("命令：")
+    print("  toddler / kids            切换年龄")
+    print("  portrait / landscape / auto  切换方向")
+    print("  quit                      退出\n")
 
     while True:
         try:
-            mode_str = "幼儿" if current_age_mode == AgeMode.TODDLER else "儿童"
-            user_input = input(f"[{mode_str}模式] 请输入: ").strip()
-
-            if user_input.lower() in ['quit', 'exit', 'q']:
-                print("再见!")
+            prompt = input(f"[{age_mode.value}/{orientation.value}] Idea> ").strip()
+            if not prompt:
+                continue
+            if prompt.lower() in ("quit", "exit", "q"):
+                print("Bye.")
                 break
-
-            if user_input.lower() == 'toddler':
-                current_age_mode = AgeMode.TODDLER
-                print("已切换到幼儿模式 (5岁以下)")
+            if prompt.lower() == "toddler":
+                age_mode = AgeMode.TODDLER
+                print("已切换 toddler")
+                continue
+            if prompt.lower() == "kids":
+                age_mode = AgeMode.KIDS
+                print("已切换 kids")
+                continue
+            if prompt.lower() in ("portrait", "landscape", "auto"):
+                orientation = Orientation(prompt.lower())
+                print(f"已切换 {orientation.value}")
                 continue
 
-            if user_input.lower() == 'kids':
-                current_age_mode = AgeMode.KIDS
-                print("已切换到儿童模式 (6岁及以上)")
-                continue
+            idea_input = IdeaInput(prompt, age_mode, orientation)
+            ts = time.strftime("%Y%m%d_%H%M%S")
+            save_path = str(Path(out_dir) / f"interactive_{age_mode.value}_{orientation.value}_{ts}.png")
 
-            if not user_input:
-                continue
-
-            scene = parse_chinese_input(user_input, current_age_mode)
-            prompts = prompt_system.get_full_prompts(scene, mode="text")
-
-            print(f"\n{'─'*70}")
-            print(f"[解析结果]")
-            print(f"  Subject: {scene.subject}")
-            print(f"  Location: {scene.location}")
-            print(f"  Action: {scene.action}")
-            print(f"  Age Mode: {scene.age_mode.value}")
-            print(f"\n[生成的 USER PROMPT]")
-            print(prompts["user_prompt"])
-            print(f"{'─'*70}\n")
+            res = gen.generate_from_idea(idea_input, model=model, save_path=save_path, retry=1)
+            if res["success"]:
+                print(f"生成成功: {save_path}\n")
+            else:
+                print(f"生成失败: {res['error']}\n")
 
         except KeyboardInterrupt:
-            print("\n再见!")
+            print("\nBye.")
             break
 
 
+# ============================================================
+# CLI
+# ============================================================
+
+def parse_args():
+    p = argparse.ArgumentParser()
+    p.add_argument("--model", default="gpt5-image-mini", help="模型别名或完整 model id")
+    p.add_argument("--out", default="output_v2", help="输出目录")
+    p.add_argument("--retry", type=int, default=1, help="每条用例重试次数")
+
+    # 文生图（idea）
+    p.add_argument("--generate", type=str, default=None, help="输入一句话 idea 生成涂色卡")
+    # 图生图
+    p.add_argument("--image2color", type=str, default=None, help="输入图片路径 -> 输出涂色卡")
+
+    # batch / interactive
+    p.add_argument("--batch", action="store_true", help="跑默认批量测试集")
+    p.add_argument("--interactive", action="store_true", help="交互模式")
+
+    # 控制变量
+    p.add_argument("--toddler", action="store_true", help="toddler 模式")
+    p.add_argument("--kids", action="store_true", help="kids 模式（默认）")
+    p.add_argument("--portrait", action="store_true", help="竖版")
+    p.add_argument("--landscape", action="store_true", help="横版")
+    p.add_argument("--auto", action="store_true", help="自动构图")
+
+    return p.parse_args()
+
+
+def main():
+    args = parse_args()
+
+    age_mode = AgeMode.TODDLER if args.toddler else AgeMode.KIDS
+    if args.kids:
+        age_mode = AgeMode.KIDS
+
+    orientation = Orientation.PORTRAIT
+    if args.landscape:
+        orientation = Orientation.LANDSCAPE
+    elif args.auto:
+        orientation = Orientation.AUTO
+    elif args.portrait:
+        orientation = Orientation.PORTRAIT
+
+    gen = OpenRouterImageGenerator()
+
+    out_dir = args.out
+    Path(out_dir).mkdir(parents=True, exist_ok=True)
+
+    if args.batch:
+        cases = default_test_set()
+        run_batch(gen, cases, args.model, out_dir, args.retry)
+        return
+
+    if args.interactive:
+        interactive_mode(gen, args.model, out_dir)
+        return
+
+    if args.generate:
+        idea_input = IdeaInput(args.generate, age_mode, orientation)
+        ts = time.strftime("%Y%m%d_%H%M%S")
+        save_path = str(Path(out_dir) / f"idea_{age_mode.value}_{orientation.value}_{ts}.png")
+        res = gen.generate_from_idea(idea_input, args.model, save_path, retry=args.retry)
+        print(json.dumps({
+            "success": res["success"],
+            "save_path": res.get("save_path"),
+            "error": res.get("error"),
+            "model": res.get("model"),
+        }, ensure_ascii=False, indent=2))
+        return
+
+    if args.image2color:
+        image_path = args.image2color
+        ts = time.strftime("%Y%m%d_%H%M%S")
+        save_path = str(Path(out_dir) / f"img2color_{age_mode.value}_{orientation.value}_{ts}.png")
+        res = gen.generate_from_image(
+            image_path=image_path,
+            age_mode=age_mode,
+            orientation=orientation,
+            model=args.model,
+            save_path=save_path,
+            retry=args.retry,
+        )
+        print(json.dumps({
+            "success": res["success"],
+            "save_path": res.get("save_path"),
+            "error": res.get("error"),
+            "model": res.get("model"),
+        }, ensure_ascii=False, indent=2))
+        return
+
+    # 默认：提示用法
+    print("用法示例：")
+    print("  python coloring_generator_v2.py --batch --model gpt5-image-mini --out output_batch")
+    print("  python coloring_generator_v2.py --generate \"A friendly dragon flying over a castle\" --kids --portrait --model nano-banana-pro")
+    print("  python coloring_generator_v2.py --image2color ./input.jpg --kids --portrait --model gpt5-image-mini")
+    print("  python coloring_generator_v2.py --interactive")
+
+
 if __name__ == "__main__":
-    import sys
-
-    print("""
-╔══════════════════════════════════════════════════════════════════════╗
-║            儿童涂色卡生成器 - OpenRouter API                         ║
-╠══════════════════════════════════════════════════════════════════════╣
-║  输入格式: 物体 在 某某地方 做什么                                    ║
-║  示例: 小猫 在 花园里 追蝴蝶                                         ║
-║                                                                      ║
-║  4个控制变量:                                                        ║
-║    1. Subject  (谁/什么)                                             ║
-║    2. Location (在哪里)                                              ║
-║    3. Action   (做什么)                                              ║
-║    4. Age Mode (toddler: ≤5岁 / kids: ≥6岁)                         ║
-╚══════════════════════════════════════════════════════════════════════╝
-    """)
-
-    if len(sys.argv) > 1:
-        cmd = sys.argv[1]
-
-        if cmd == "--test":
-            test_system_prompt()
-            test_prompt_system()
-            test_image_to_coloring()
-            test_full_generation()
-
-        elif cmd == "--interactive":
-            interactive_mode()
-
-        elif cmd == "--generate":
-            if len(sys.argv) > 2:
-                # 检查年龄模式参数
-                age_mode = AgeMode.KIDS
-                args = sys.argv[2:]
-
-                if "--toddler" in args:
-                    age_mode = AgeMode.TODDLER
-                    args.remove("--toddler")
-                elif "--kids" in args:
-                    age_mode = AgeMode.KIDS
-                    args.remove("--kids")
-
-                scene_text = " ".join(args)
-                scene = parse_chinese_input(scene_text, age_mode)
-
-                generator = OpenRouterImageGenerator()
-                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                result = generator.generate_from_text(
-                    scene=scene,
-                    save_path=f"output/coloring_{timestamp}.png"
-                )
-                print(json.dumps({
-                    "success": result["success"],
-                    "save_path": result.get("save_path"),
-                    "error": result.get("error")
-                }, ensure_ascii=False, indent=2))
-
-        elif cmd == "--system-prompt":
-            test_system_prompt()
-
-        else:
-            print("用法:")
-            print("  python coloring_generator.py --test              # 运行所有测试")
-            print("  python coloring_generator.py --interactive       # 交互模式")
-            print("  python coloring_generator.py --system-prompt     # 显示系统提示词")
-            print("  python coloring_generator.py --generate [--toddler|--kids] 小猫 在 花园里 追蝴蝶")
-    else:
-        # 默认运行测试
-        test_prompt_system()
+    main()
