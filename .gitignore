@@ -41,3 +41,5 @@ coverage.xml
 .env
 .env.*
 
+output*/
+.claude/
