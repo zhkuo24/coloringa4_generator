@@ -147,14 +147,13 @@ Target complexity: MODERATE
 - 5–10 clear objects
 - Medium to large coloring areas
 - Simple decorative elements allowed
-- Light background scenery for storytelling
+- Background should directly relate to the requested scene
 - Characters may show action and emotion
 
 Imagination style:
 Playful and adventurous.
-Think secret gardens, tree houses,
-underwater worlds, friendly dragons,
-and gentle magical scenes.
+Focus on the specific theme requested by the user.
+Add only elements that logically belong to the scene.
 Decorative details must remain large and simple.
 """
     }
@@ -172,8 +171,8 @@ Decorative details must remain large and simple.
 - Avoid crowded or compressed areas
 """,
         Orientation.AUTO: """AUTO COMPOSITION:
-- Naturally fill the entire page
-- Extend the scene with simple environment elements
+- Naturally fill the entire page with the main subject
+- Focus on the requested elements, avoid adding unrelated objects
 - No empty corners, no clutter
 """
     }
@@ -256,6 +255,78 @@ FINAL REQUIREMENTS:
                 "orientation": orientation.value,
             }
         }
+
+# ============================================================
+# Orientation Detector（使用便宜的文本模型判断横竖版）
+# ============================================================
+
+class OrientationDetector:
+    """使用 LLM 自动判断涂色卡最佳布局方向"""
+
+    DEFAULT_MODEL = "openai/gpt-4o-mini"
+
+    DETECTION_PROMPT = """判断这个儿童涂色卡的最佳布局方向。
+
+创意内容: {idea}
+
+只回答一个词: PORTRAIT 或 LANDSCAPE
+
+判断规则:
+- 宽/横向场景（球场、海洋、公路、多人并排、赛车、火车）→ LANDSCAPE
+- 高/纵向场景（树、塔、火箭、站立人物、长颈鹿、摩天大楼）→ PORTRAIT
+- 不确定时默认 → PORTRAIT
+"""
+
+    def __init__(
+        self,
+        api_key: Optional[str] = None,
+        base_url: str = "https://openrouter.ai/api/v1",
+        model: Optional[str] = None,
+    ):
+        self.api_key = api_key or os.getenv("OPENROUTER_API_KEY")
+        if not self.api_key:
+            raise ValueError("请设置 OPENROUTER_API_KEY 环境变量或传入 api_key 参数")
+        self.base_url = base_url
+        self.model = model or self.DEFAULT_MODEL
+
+    def detect(self, idea: str) -> Orientation:
+        """基于 idea 内容自动判断 portrait/landscape"""
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json",
+        }
+
+        payload = {
+            "model": self.model,
+            "messages": [
+                {"role": "user", "content": self.DETECTION_PROMPT.format(idea=idea)}
+            ],
+            "max_tokens": 20,
+            "temperature": 0,
+        }
+
+        try:
+            resp = requests.post(
+                f"{self.base_url}/chat/completions",
+                headers=headers,
+                json=payload,
+                timeout=30,
+            )
+            resp.raise_for_status()
+            result = resp.json()
+            answer = result["choices"][0]["message"]["content"].strip().upper()
+
+            if "LANDSCAPE" in answer:
+                print(f"[OrientationDetector] idea=\"{idea}\" → LANDSCAPE")
+                return Orientation.LANDSCAPE
+            else:
+                print(f"[OrientationDetector] idea=\"{idea}\" → PORTRAIT")
+                return Orientation.PORTRAIT
+
+        except Exception as e:
+            print(f"[OrientationDetector] 检测失败，默认使用 PORTRAIT: {e}")
+            return Orientation.PORTRAIT
+
 
 # ============================================================
 # OpenRouter Generator（system/user 分离）
@@ -909,7 +980,7 @@ def parse_args():
     p.add_argument("--kids", action="store_true", help="kids 模式（默认）")
     p.add_argument("--portrait", action="store_true", help="竖版")
     p.add_argument("--landscape", action="store_true", help="横版")
-    p.add_argument("--auto", action="store_true", help="自动构图")
+    p.add_argument("--auto", action="store_true", help="自动检测横竖版（使用 GPT-4o Mini 判断）")
 
     # 输出尺寸控制（不同模型支持不同方式）
     p.add_argument("--gemini-image-size", default="1K", choices=["1K", "2K", "4K"],
@@ -956,6 +1027,11 @@ def main():
         return
 
     if args.generate:
+        # 如果是 AUTO 模式，使用 OrientationDetector 自动检测
+        if orientation == Orientation.AUTO:
+            detector = OrientationDetector()
+            orientation = detector.detect(args.generate)
+
         idea_input = IdeaInput(args.generate, age_mode, orientation)
         ts = time.strftime("%Y%m%d_%H%M%S")
         save_path = str(Path(out_dir) / f"idea_{age_mode.value}_{orientation.value}_{ts}.png")
