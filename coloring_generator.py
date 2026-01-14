@@ -1,22 +1,17 @@
 #!/usr/bin/env python3
 """
-儿童涂色卡生成器 v2（推荐方案一：单输入 idea）
-- OpenRouter chat/completions
-- system / user 分离 messages（更稳）
-- 支持：文生图（idea->image）、图生图（image->coloring）
-- 去掉：PNG->PDF / 矢量化 / reportlab / cairosvg / potrace 等后处理
-- 输出：PNG + JSON 记录
-- 说明：OpenRouter 对 Gemini 系列可用 image_config 控制比例/分辨率；
-        OpenAI 图像模型经由 OpenRouter chat/completions 可能忽略 size，回落到 1024x1024。
-- 如需稳定的竖版/横版尺寸控制，建议使用 --api openai（OpenAI 官方 Images API）。
+儿童涂色卡生成器 v3（统一 API 架构）
+- 支持两种 API 格式：/chat/completions 和 /images/generations
+- 根据模型配置自动选择 API 类型
+- 支持切换不同 API 平台（通过 base_url）
 
 环境变量：
-  OPENROUTER_API_KEY=xxxx
+  API_KEY=xxxx
+  API_BASE_URL=https://yunwu.ai/v1
 
 用法示例：
-  python coloring_generator.py --batch --model gpt5-image-mini --out output_batch
-  python coloring_generator.py --generate "A friendly dragon flying over a castle" --kids --portrait --model nano-banana-pro
-  python coloring_generator.py --image2color ./input.jpg --kids --portrait --model gpt5-image-mini
+  python coloring_generator.py --generate "A friendly dragon" --model gpt-image-1-mini
+  python coloring_generator.py --generate "机器人在球场打球" --auto
   python coloring_generator.py --interactive
 """
 
@@ -55,9 +50,10 @@ class Orientation(Enum):
     AUTO = "auto"
 
 
-class ApiBackend(Enum):
-    OPENROUTER = "openrouter"
-    OPENAI = "openai"
+class APIType(Enum):
+    """API 接口格式（都是文生图，但不同模型使用不同接口）"""
+    CHAT_COMPLETIONS = "chat"      # /v1/chat/completions（Gemini 等模型使用）
+    IMAGES_GENERATIONS = "images"  # /v1/images/generations（GPT-Image、DALL-E 等模型使用）
 
 
 @dataclass
@@ -66,6 +62,43 @@ class IdeaInput:
     idea: str
     age_mode: AgeMode = AgeMode.KIDS
     orientation: Orientation = Orientation.AUTO
+
+
+# ============================================================
+# 模型配置（包含 API 类型）
+# ============================================================
+
+MODEL_CONFIG = {
+    # GPT-Image 系列 - 使用 images API
+    "gpt-image-1": {
+        "model_id": "gpt-image-1",
+        "api_type": APIType.IMAGES_GENERATIONS,
+    },
+    "gpt-image-1-mini": {
+        "model_id": "gpt-image-1-mini",
+        "api_type": APIType.IMAGES_GENERATIONS,
+    },
+    "gpt-image-1.5": {
+        "model_id": "gpt-image-1.5",
+        "api_type": APIType.IMAGES_GENERATIONS,
+    },
+    # Gemini 系列 - 使用 chat API（支持 modalities）
+    "gemini-image": {
+        "model_id": "gemini-3-pro-image-preview",
+        "api_type": APIType.CHAT_COMPLETIONS,
+    },
+    # z-image - 使用 images API
+    "z-image": {
+        "model_id": "z-image",
+        "api_type": APIType.IMAGES_GENERATIONS,
+    },
+
+    # 默认模型
+    "default": {
+        "model_id": "gpt-image-1",
+        "api_type": APIType.IMAGES_GENERATIONS,
+    },
+}
 
 # ============================================================
 # Prompt System（融合版，生产级）
@@ -192,38 +225,6 @@ and visually pleasing for children.
 Ensure the result is print-ready and easy to color.
 """
 
-    IMAGE_TO_COLORING_TEMPLATE = """Convert the provided image into a children's coloring book page.
-
-IMPORTANT:
-Do NOT trace or outline the image directly.
-Redraw the scene as simplified, child-friendly line art.
-
-GOALS:
-- Preserve the main subject and overall idea of the image
-- Reinterpret the scene with imagination and warmth
-- Make the illustration enjoyable and easy for children to color
-
-{age_mode_prompt}
-
-TRANSFORMATION RULES:
-- Simplify all shapes into rounded, friendly forms
-- Remove all textures, shadows, lighting effects, and gradients
-- Eliminate unnecessary or confusing details
-- Ensure all outlines are clean, smooth, and fully closed
-- Keep line thickness uniform throughout the illustration
-- Avoid overlapping lines, tight spaces, or tiny decorative details
-- All coloring areas must be large and comfortable to fill
-
-COMPOSITION:
-{orientation_prompt}
-
-FINAL REQUIREMENTS:
-- Black outlines on a pure white background only
-- No filled black areas, no shading, no grayscale
-- No text, letters, numbers, logos, or symbols
-- The result must be print-ready and safe for children to color
-"""
-
     def build_text_prompts(self, idea_input: IdeaInput) -> Dict[str, Any]:
         user_prompt = self.IDEA_TO_COLORING_TEMPLATE.format(
             idea=idea_input.idea.strip(),
@@ -241,20 +242,6 @@ FINAL REQUIREMENTS:
             }
         }
 
-    def build_image_prompts(self, age_mode: AgeMode, orientation: Orientation) -> Dict[str, Any]:
-        user_prompt = self.IMAGE_TO_COLORING_TEMPLATE.format(
-            age_mode_prompt=self.AGE_MODE_PROMPTS[age_mode],
-            orientation_prompt=self.ORIENTATION_PROMPTS[orientation],
-        )
-        return {
-            "system_prompt": self.SYSTEM_PROMPT,
-            "user_prompt": user_prompt,
-            "meta": {
-                "mode": "image",
-                "age_mode": age_mode.value,
-                "orientation": orientation.value,
-            }
-        }
 
 # ============================================================
 # Orientation Detector（使用便宜的文本模型判断横竖版）
@@ -263,7 +250,7 @@ FINAL REQUIREMENTS:
 class OrientationDetector:
     """使用 LLM 自动判断涂色卡最佳布局方向"""
 
-    DEFAULT_MODEL = "openai/gpt-4o-mini"
+    DEFAULT_MODEL = "gpt-4o-mini"
 
     DETECTION_PROMPT = """判断这个儿童涂色卡的最佳布局方向。
 
@@ -280,13 +267,13 @@ class OrientationDetector:
     def __init__(
         self,
         api_key: Optional[str] = None,
-        base_url: str = "https://openrouter.ai/api/v1",
+        base_url: Optional[str] = None,
         model: Optional[str] = None,
     ):
-        self.api_key = api_key or os.getenv("OPENROUTER_API_KEY")
+        self.api_key = api_key or os.getenv("API_KEY")
         if not self.api_key:
-            raise ValueError("请设置 OPENROUTER_API_KEY 环境变量或传入 api_key 参数")
-        self.base_url = base_url
+            raise ValueError("请设置 API_KEY 环境变量或传入 api_key 参数")
+        self.base_url = (base_url or os.getenv("API_BASE_URL", "https://yunwu.ai/v1")).rstrip("/")
         self.model = model or self.DEFAULT_MODEL
 
     def detect(self, idea: str) -> Orientation:
@@ -329,54 +316,39 @@ class OrientationDetector:
 
 
 # ============================================================
-# OpenRouter Generator（system/user 分离）
+# 统一的图像生成器
 # ============================================================
 
-class OpenRouterImageGenerator:
+class ImageGenerator:
     """
-    OpenRouter 图像生成器
-    - 所有请求走 /chat/completions
-    - messages: system + user 分离
-    """
+    统一的图像生成器，支持多种 API 格式和平台
 
-    SUPPORTED_MODELS = {
-        "gpt5-image": "openai/gpt-5-image",
-        "gpt5-image-mini": "openai/gpt-5-image-mini",
-        "gemini-image": "google/gemini-2.5-flash-image",
-        "nano-banana-pro": "google/gemini-3-pro-image-preview",
-        "default": "openai/gpt-5-image-mini",
-    }
+    特点：
+    1. 根据模型配置自动选择 API 类型（chat/completions 或 images/generations）
+    2. 支持切换不同 API 平台（通过 base_url）
+    3. 提示词系统保持不变
+    """
 
     def __init__(
         self,
         api_key: Optional[str] = None,
-        base_url: str = "https://openrouter.ai/api/v1",
-        gemini_image_size: str = "1K",
-        openai_size: Optional[str] = None,
+        base_url: Optional[str] = None,
     ):
-        """Create a generator.
-
-        Args:
-            gemini_image_size: Gemini image_config.image_size, one of {"1K","2K","4K"}.
-            openai_size: Optional override for OpenAI GPT Image size. One of
-                         {"1024x1024","1024x1536","1536x1024","auto"}.
-                         If None, choose based on orientation.
-        """
-        self.api_key = api_key or os.getenv("OPENROUTER_API_KEY")
+        self.api_key = api_key or os.getenv("API_KEY")
         if not self.api_key:
-            raise ValueError("请设置 OPENROUTER_API_KEY 环境变量或传入 api_key 参数")
-        self.base_url = base_url
+            raise ValueError("请设置 API_KEY 环境变量或传入 api_key 参数")
+        self.base_url = (base_url or os.getenv("API_BASE_URL", "https://yunwu.ai/v1")).rstrip("/")
         self.prompt_system = ColoringPromptSystem()
 
-        self.gemini_image_size = (gemini_image_size or "2K").upper()
-        if self.gemini_image_size not in {"1K", "2K", "4K"}:
-            raise ValueError("gemini_image_size 只能是 1K/2K/4K")
-
-        self.openai_size = openai_size
-        if self.openai_size is not None:
-            allowed = {"1024x1024", "1024x1536", "1536x1024", "auto"}
-            if self.openai_size not in allowed:
-                raise ValueError("openai_size 只能是 1024x1024/1024x1536/1536x1024/auto")
+    def get_model_config(self, model: str) -> Dict[str, Any]:
+        """获取模型配置，支持直接传入完整 model_id"""
+        if model in MODEL_CONFIG:
+            return MODEL_CONFIG[model]
+        # 如果不在配置中，假设是完整的 model_id，默认使用 images API
+        return {
+            "model_id": model,
+            "api_type": APIType.IMAGES_GENERATIONS,
+        }
 
     def generate_from_idea(
         self,
@@ -386,78 +358,70 @@ class OpenRouterImageGenerator:
         timeout_sec: int = 180,
         retry: int = 1,
     ) -> Dict[str, Any]:
+        """文生图主入口"""
         prompts = self.prompt_system.build_text_prompts(idea_input)
-        return self._generate(
-            prompts=prompts,
-            model=model,
-            save_path=save_path,
-            timeout_sec=timeout_sec,
-            retry=retry,
-            image_path=None,
-        )
+        config = self.get_model_config(model)
 
-    def generate_from_image(
-        self,
-        image_path: str,
-        age_mode: AgeMode,
-        orientation: Orientation,
-        model: str,
-        save_path: str,
-        timeout_sec: int = 180,
-        retry: int = 1,
-    ) -> Dict[str, Any]:
-        prompts = self.prompt_system.build_image_prompts(age_mode, orientation)
-        return self._generate(
-            prompts=prompts,
-            model=model,
-            save_path=save_path,
-            timeout_sec=timeout_sec,
-            retry=retry,
-            image_path=image_path,
-        )
+        if config["api_type"] == APIType.CHAT_COMPLETIONS:
+            return self._generate_via_chat(
+                prompts=prompts,
+                model_id=config["model_id"],
+                save_path=save_path,
+                timeout_sec=timeout_sec,
+                retry=retry,
+            )
+        else:
+            return self._generate_via_images(
+                prompts=prompts,
+                model_id=config["model_id"],
+                save_path=save_path,
+                timeout_sec=timeout_sec,
+                retry=retry,
+            )
 
-    def _generate(
+    # ============================================================
+    # Chat Completions API (/chat/completions)
+    # ============================================================
+
+    def _generate_via_chat(
         self,
         prompts: Dict[str, Any],
-        model: str,
+        model_id: str,
         save_path: str,
         timeout_sec: int,
         retry: int,
-        image_path: Optional[str],
     ) -> Dict[str, Any]:
-        model_id = self.SUPPORTED_MODELS.get(model, model)
-
+        """使用 /chat/completions 接口生成图像"""
         endpoint = f"{self.base_url}/chat/completions"
         headers = {
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json",
-            "HTTP-Referer": "https://coloring-generator.local",
-            "X-Title": "Children Coloring Page Generator v2",
         }
 
-        payload = self._build_payload(prompts, model_id, image_path=image_path)
+        payload = self._build_chat_payload(prompts, model_id)
 
         t0 = time.time()
         last_err = None
+
         for attempt in range(retry + 1):
             try:
                 resp = requests.post(endpoint, headers=headers, json=payload, timeout=timeout_sec)
                 resp.raise_for_status()
                 result = resp.json()
 
-                image_data = self._extract_image(result)
+                image_data = self._extract_image_from_chat(result)
                 if not image_data:
-                    raise RuntimeError("模型未返回图像数据（message.images / data URL 为空）")
+                    raise RuntimeError("模型未返回图像数据")
 
                 self._save_image(image_data, save_path)
                 return {
                     "success": True,
                     "model": model_id,
+                    "api_type": "chat",
                     "elapsed_sec": round(time.time() - t0, 3),
                     "save_path": save_path,
                     "meta": prompts.get("meta", {}),
                     "user_prompt_preview": prompts["user_prompt"][:500],
-                    "raw_response": result,
                 }
 
             except Exception as e:
@@ -469,91 +433,37 @@ class OpenRouterImageGenerator:
         return {
             "success": False,
             "model": model_id,
+            "api_type": "chat",
             "elapsed_sec": round(time.time() - t0, 3),
             "error": last_err,
             "meta": prompts.get("meta", {}),
             "user_prompt_preview": prompts["user_prompt"][:500],
         }
 
-    def _build_payload(self, prompts: Dict[str, Any], model_id: str, image_path: Optional[str]) -> Dict[str, Any]:
-        # ✅ system/user 分离
+    def _build_chat_payload(
+        self,
+        prompts: Dict[str, Any],
+        model_id: str,
+    ) -> Dict[str, Any]:
+        """构建 chat/completions 请求 payload"""
         system_msg = {"role": "system", "content": prompts["system_prompt"]}
-
-        if image_path:
-            # 图生图：user content 为多段（image + text）
-            image_b64, mime_type = self._load_image_as_data_url(image_path)
-            user_msg = {
-                "role": "user",
-                "content": [
-                    {"type": "image_url", "image_url": {"url": image_b64}},
-                    {"type": "text", "text": prompts["user_prompt"]},
-                ],
-            }
-        else:
-            user_msg = {"role": "user", "content": prompts["user_prompt"]}
+        user_msg = {"role": "user", "content": prompts["user_prompt"]}
 
         payload: Dict[str, Any] = {
             "model": model_id,
             "messages": [system_msg, user_msg],
-            # OpenRouter: 必须声明输出模态，否则经常回落到默认 1:1
             "modalities": ["image", "text"],
         }
 
-        # 尺寸/比例策略：按模型原生参数设置
-        # - OpenAI GPT Image: 只能通过 size 选择固定画布（1024x1024 / 1024x1536 / 1536x1024 / auto）
-        # - Gemini Image: 使用 image_config.aspect_ratio + image_config.image_size (1K/2K/4K)
+        # 尺寸控制
         orientation = (prompts.get("meta", {}) or {}).get("orientation", "auto")
-
-        if "gemini" in model_id.lower():
-            aspect_map = {
-                "portrait": "2:3",
-                "landscape": "3:2",
-                "auto": "2:3",  # 更贴近涂色卡竖版工作流
-            }
-            aspect_ratio = aspect_map.get(orientation, "2:3")
-
-            payload["image_config"] = {
-                "aspect_ratio": aspect_ratio,
-                "image_size": self.gemini_image_size,  # 1K/2K/4K
-            }
-        else:
-            # OpenAI GPT Image
-            # NOTE: OpenRouter 文档对 Gemini 提供 image_config（aspect_ratio/image_size）控制比例。
-            # 对 OpenAI 图像模型，经由 /chat/completions 的 provider 可能忽略 `size` 并回落到 1024x1024。
-            # 如需稳定尺寸控制，请使用 Gemini 图像模型或 --api openai（官方 Images API）。
-            if (self.openai_size is not None) or (orientation in ("portrait", "landscape", "auto")):
-                print("[WARN] OpenRouter OpenAI image models may ignore `size` and return 1024x1024. Use a Gemini image model or --api openai for guaranteed aspect ratio.")
-            if self.openai_size is not None:
-                payload["size"] = self.openai_size
-            else:
-                if orientation == "landscape":
-                    payload["size"] = "1536x1024"
-                elif orientation == "portrait":
-                    payload["size"] = "1024x1536"
-                else:
-                    payload["size"] = "1024x1536"  # auto 默认竖版
-
-            payload["quality"] = "high"
+        size = self._get_size_for_orientation(orientation)
+        payload["size"] = size
 
         return payload
 
-    def _load_image_as_data_url(self, image_path: str) -> (str, str):
-        ext = Path(image_path).suffix.lower()
-        mime_type = {
-            ".jpg": "image/jpeg",
-            ".jpeg": "image/jpeg",
-            ".png": "image/png",
-            ".gif": "image/gif",
-            ".webp": "image/webp",
-        }.get(ext, "image/png")
-
-        with open(image_path, "rb") as f:
-            b64 = base64.b64encode(f.read()).decode("utf-8")
-
-        return f"data:{mime_type};base64,{b64}", mime_type
-
-    def _extract_image(self, result: Dict[str, Any]) -> Optional[str]:
-        """Extract image data/url from OpenRouter chat/completions response."""
+    def _extract_image_from_chat(self, result: Dict[str, Any]) -> Optional[str]:
+        """从 chat/completions 响应中提取图像"""
         try:
             choices = result.get("choices", [])
             if not choices:
@@ -561,7 +471,7 @@ class OpenRouterImageGenerator:
 
             msg = (choices[0].get("message") or {})
 
-            # 1) Common OpenRouter image response: message.images
+            # 1) message.images 列表
             images = msg.get("images", [])
             if isinstance(images, list) and images:
                 first = images[0]
@@ -574,7 +484,7 @@ class OpenRouterImageGenerator:
 
             content = msg.get("content")
 
-            # 2) Some providers return multi-part content list
+            # 2) 多部分内容列表
             if isinstance(content, list):
                 for part in content:
                     if not isinstance(part, dict):
@@ -588,7 +498,7 @@ class OpenRouterImageGenerator:
                         if url:
                             return url
 
-            # 3) content as string: data URL or http URL
+            # 3) content 为字符串（data URL 或 http URL）
             if isinstance(content, str):
                 if content.startswith("http") or content.startswith("data:image"):
                     return content
@@ -597,128 +507,38 @@ class OpenRouterImageGenerator:
         except Exception:
             return None
 
-    def _save_image(self, image_data: str, save_path: str) -> None:
-        Path(save_path).parent.mkdir(parents=True, exist_ok=True)
+    # ============================================================
+    # Images API (/images/generations)
+    # ============================================================
 
-        if image_data.startswith("http"):
-            r = requests.get(image_data, timeout=60)
-            r.raise_for_status()
-            raw = r.content
-        elif image_data.startswith("data:image"):
-            b64 = image_data.split(",", 1)[1] if "," in image_data else image_data
-            raw = base64.b64decode(b64)
-        else:
-            raw = base64.b64decode(image_data)
-
-        with open(save_path, "wb") as f:
-            f.write(raw)
- 
-class OpenAIOfficialImageGenerator:
-    """OpenAI 官方 Images API 生成器（稳定支持 size 控制）
-
-    - 文生图：POST /v1/images/generations
-    - 图生图：POST /v1/images/edits
-
-    需要环境变量：OPENAI_API_KEY
-    """
-
-    SUPPORTED_MODELS = {
-        "gpt-image-1": "gpt-image-1",
-        "gpt-image-1-mini": "gpt-image-1-mini",
-        "gpt-image-1.5": "gpt-image-1.5",
-        "dall-e-3": "dall-e-3",
-        "dall-e-2": "dall-e-2",
-        "default": "gpt-image-1",
-    }
-
-    def __init__(
-        self,
-        api_key: Optional[str] = None,
-        base_url: str = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1"),
-        openai_size: Optional[str] = None,
-    ):
-        self.api_key = api_key or os.getenv("OPENAI_API_KEY")
-        if not self.api_key:
-            raise ValueError("请设置 OPENAI_API_KEY 环境变量或传入 api_key 参数（使用 --api openai 时必需）")
-
-        self.base_url = base_url.rstrip("/")
-        self.prompt_system = ColoringPromptSystem()
-
-        self.openai_size = openai_size
-        if self.openai_size is not None:
-            allowed = {"1024x1024", "1024x1536", "1536x1024"}
-            if self.openai_size not in allowed:
-                raise ValueError("openai_size 只能是 1024x1024/1024x1536/1536x1024")
-
-    def generate_from_idea(
-        self,
-        idea_input: IdeaInput,
-        model: str,
-        save_path: str,
-        timeout_sec: int = 180,
-        retry: int = 1,
-    ) -> Dict[str, Any]:
-        prompts = self.prompt_system.build_text_prompts(idea_input)
-        return self._generate(
-            prompts=prompts,
-            model=model,
-            save_path=save_path,
-            timeout_sec=timeout_sec,
-            retry=retry,
-            image_path=None,
-        )
-
-    def generate_from_image(
-        self,
-        image_path: str,
-        age_mode: AgeMode,
-        orientation: Orientation,
-        model: str,
-        save_path: str,
-        timeout_sec: int = 180,
-        retry: int = 1,
-    ) -> Dict[str, Any]:
-        prompts = self.prompt_system.build_image_prompts(age_mode, orientation)
-        return self._generate(
-            prompts=prompts,
-            model=model,
-            save_path=save_path,
-            timeout_sec=timeout_sec,
-            retry=retry,
-            image_path=image_path,
-        )
-
-    def _choose_size(self, orientation: str) -> str:
-        if self.openai_size is not None:
-            return self.openai_size
-        if orientation == "landscape":
-            return "1536x1024"
-        # portrait / auto 默认竖版
-        return "1024x1536"
-
-    def _generate(
+    def _generate_via_images(
         self,
         prompts: Dict[str, Any],
-        model: str,
+        model_id: str,
         save_path: str,
         timeout_sec: int,
         retry: int,
-        image_path: Optional[str],
     ) -> Dict[str, Any]:
-        model_id = self.SUPPORTED_MODELS.get(model, model)
-
+        """使用 /images/generations 接口生成图像"""
+        endpoint = f"{self.base_url}/images/generations"
         headers = {
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json",
         }
 
-        meta = (prompts.get("meta", {}) or {})
+        meta = prompts.get("meta", {}) or {}
         orientation = meta.get("orientation", "auto")
-        size = self._choose_size(orientation)
+        size = self._get_size_for_orientation(orientation)
 
-        request_info = {
-            "requested_size": size,
-            "endpoint": None,
+        # 将 system_prompt 和 user_prompt 合并为一个 prompt
+        full_prompt = f"{prompts['system_prompt']}\n\n{prompts['user_prompt']}"
+
+        payload = {
+            "model": model_id,
+            "prompt": full_prompt,
+            "n": 1,
+            "size": size,
+            "quality": "high",
         }
 
         t0 = time.time()
@@ -726,68 +546,27 @@ class OpenAIOfficialImageGenerator:
 
         for attempt in range(retry + 1):
             try:
-                if image_path is None:
-                    # 文生图
-                    endpoint = f"{self.base_url}/images/generations"
-                    request_info["endpoint"] = endpoint
-                    payload = {
-                        "model": model_id,
-                        "prompt": prompts["user_prompt"],
-                        "n": 1,
-                        "size": size,
-                        "quality": "high",
-                    }
-                    resp = requests.post(endpoint, headers=headers, json=payload, timeout=timeout_sec)
-                else:
-                    # 图生图（edits，multipart/form-data）
-                    endpoint = f"{self.base_url}/images/edits"
-                    request_info["endpoint"] = endpoint
-                    data = {
-                        "model": model_id,
-                        "prompt": prompts["user_prompt"],
-                        "n": "1",
-                        "size": size,
-                        "quality": "high",
-                    }
-                    with open(image_path, "rb") as f:
-                        files = {
-                            "image": (os.path.basename(image_path), f, "application/octet-stream"),
-                        }
-                        resp = requests.post(endpoint, headers=headers, data=data, files=files, timeout=timeout_sec)
-
+                resp = requests.post(endpoint, headers=headers, json=payload, timeout=timeout_sec)
                 resp.raise_for_status()
                 result = resp.json()
-                # Debug hint if gateway returns a non-standard schema
-                if not isinstance(result, dict):
-                    raise RuntimeError(f"OpenAI Images API 返回了非 JSON 对象: {type(result)}")
 
-                image_data = self._extract_image(result)
+                image_data = self._extract_image_from_images(result)
                 if not image_data:
-                    raise RuntimeError(
-                        "OpenAI Images API 未返回 data[0].b64_json 或 url; "
-                        f"response keys={list(result.keys())}; "
-                        f"snippet={json.dumps(result, ensure_ascii=False)[:400]}"
-                    )
+                    raise RuntimeError(f"API 未返回图像数据: {json.dumps(result, ensure_ascii=False)[:400]}")
 
                 self._save_image(image_data, save_path)
 
-                # 可选：打印保存后的图片尺寸，快速确认是否仍为 1024x1024
-                try:
-                    from PIL import Image
-                    with Image.open(save_path) as im:
-                        print("  SAVED PNG SIZE:", im.size)
-                except Exception:
-                    pass
+                # 打印保存后的图片尺寸
+                self._print_saved_image_size(save_path)
 
                 return {
                     "success": True,
                     "model": model_id,
+                    "api_type": "images",
                     "elapsed_sec": round(time.time() - t0, 3),
                     "save_path": save_path,
                     "meta": meta,
-                    "request_info": request_info,
                     "user_prompt_preview": prompts["user_prompt"][:500],
-                    "raw_response": result,
                 }
 
             except Exception as e:
@@ -799,14 +578,15 @@ class OpenAIOfficialImageGenerator:
         return {
             "success": False,
             "model": model_id,
+            "api_type": "images",
             "elapsed_sec": round(time.time() - t0, 3),
             "error": last_err,
             "meta": meta,
-            "request_info": request_info,
             "user_prompt_preview": prompts["user_prompt"][:500],
         }
 
-    def _extract_image(self, result: Dict[str, Any]) -> Optional[str]:
+    def _extract_image_from_images(self, result: Dict[str, Any]) -> Optional[str]:
+        """从 images API 响应中提取图像"""
         try:
             data = result.get("data")
             if isinstance(data, list) and data:
@@ -821,7 +601,19 @@ class OpenAIOfficialImageGenerator:
         except Exception:
             return None
 
+    # ============================================================
+    # 工具方法
+    # ============================================================
+
+    def _get_size_for_orientation(self, orientation: str) -> str:
+        """根据 orientation 返回尺寸"""
+        if orientation == "landscape":
+            return "1536x1024"
+        # portrait / auto 默认竖版
+        return "1024x1536"
+
     def _save_image(self, image_data: str, save_path: str) -> None:
+        """保存图像到文件"""
         Path(save_path).parent.mkdir(parents=True, exist_ok=True)
 
         if image_data.startswith("http"):
@@ -832,11 +624,20 @@ class OpenAIOfficialImageGenerator:
             b64 = image_data.split(",", 1)[1] if "," in image_data else image_data
             raw = base64.b64decode(b64)
         else:
-            # OpenAI Images API 常见：直接给 b64_json
+            # 直接给 base64
             raw = base64.b64decode(image_data)
 
         with open(save_path, "wb") as f:
             f.write(raw)
+
+    def _print_saved_image_size(self, save_path: str) -> None:
+        """打印保存后的图片尺寸"""
+        try:
+            from PIL import Image
+            with Image.open(save_path) as im:
+                print(f"  SAVED PNG SIZE: {im.size}")
+        except Exception:
+            pass
 
 
 # ============================================================
@@ -856,7 +657,7 @@ def default_test_set() -> List[IdeaInput]:
     ]
 
 
-def run_batch(gen: OpenRouterImageGenerator, cases: List[IdeaInput], model: str, out_dir: str, retry: int) -> Dict[str, Any]:
+def run_batch(gen: ImageGenerator, cases: List[IdeaInput], model: str, out_dir: str, retry: int) -> Dict[str, Any]:
     Path(out_dir).mkdir(parents=True, exist_ok=True)
     results: List[Dict[str, Any]] = []
 
@@ -903,16 +704,16 @@ def run_batch(gen: OpenRouterImageGenerator, cases: List[IdeaInput], model: str,
 
 
 # ============================================================
-# 交互模式（仅 idea）
+# 交互模式
 # ============================================================
 
-def interactive_mode(gen: OpenRouterImageGenerator, model: str, out_dir: str):
+def interactive_mode(gen: ImageGenerator, model: str, out_dir: str):
     Path(out_dir).mkdir(parents=True, exist_ok=True)
 
     age_mode = AgeMode.KIDS
     orientation = Orientation.PORTRAIT
 
-    print("\n儿童涂色卡生成器 v2（单输入 idea）")
+    print("\n儿童涂色卡生成器 v3（统一 API 架构）")
     print("命令：")
     print("  toddler / kids            切换年龄")
     print("  portrait / landscape / auto  切换方向")
@@ -959,17 +760,14 @@ def interactive_mode(gen: OpenRouterImageGenerator, model: str, out_dir: str):
 # ============================================================
 
 def parse_args():
-    p = argparse.ArgumentParser()
-    p.add_argument("--model", default="nano-banana-pro", help="模型别名或完整 model id")
-    p.add_argument("--out", default="output_v2", help="输出目录")
+    p = argparse.ArgumentParser(description="儿童涂色卡生成器 v3（统一 API 架构）")
+    p.add_argument("--model", default="gpt-image-1-mini", help="模型别名或完整 model id")
+    p.add_argument("--out", default="output_v3", help="输出目录")
     p.add_argument("--retry", type=int, default=1, help="每条用例重试次数")
-    p.add_argument("--api", default="openrouter", choices=["openrouter", "openai"],
-                   help="调用后端：openrouter=OpenRouter chat/completions；openai=OpenAI 官方 Images API（需要 OPENAI_API_KEY）")
+    p.add_argument("--base-url", default=None, help="API base URL（默认从环境变量 API_BASE_URL 读取）")
 
     # 文生图（idea）
     p.add_argument("--generate", type=str, default=None, help="输入一句话 idea 生成涂色卡")
-    # 图生图
-    p.add_argument("--image2color", type=str, default=None, help="输入图片路径 -> 输出涂色卡")
 
     # batch / interactive
     p.add_argument("--batch", action="store_true", help="跑默认批量测试集")
@@ -981,14 +779,6 @@ def parse_args():
     p.add_argument("--portrait", action="store_true", help="竖版")
     p.add_argument("--landscape", action="store_true", help="横版")
     p.add_argument("--auto", action="store_true", help="自动检测横竖版（使用 GPT-4o Mini 判断）")
-
-    # 输出尺寸控制（不同模型支持不同方式）
-    p.add_argument("--gemini-image-size", default="1K", choices=["1K", "2K", "4K"],
-                   help="Gemini 系列 image_config.image_size（默认 1K）")
-    p.add_argument("--openai-size", default=None, choices=["1024x1024", "1024x1536", "1536x1024", "auto"],
-                   help="OpenAI Images API 的 size 覆盖值；在 OpenRouter+OpenAI 模型上可能被忽略。不传则根据 orientation 自动选择")
-    p.add_argument("--openai-base-url", default=None,
-                   help="OpenAI Images API base_url 覆盖值，例如 https://api.openai.com/v1 或 https://api.bianxie.ai/v1。也可用环境变量 OPENAI_BASE_URL")
 
     return p.parse_args()
 
@@ -1008,11 +798,8 @@ def main():
     elif args.portrait:
         orientation = Orientation.PORTRAIT
 
-    if args.api == "openai":
-        base_url = args.openai_base_url or os.getenv("OPENAI_BASE_URL") or "https://api.openai.com/v1"
-        gen = OpenAIOfficialImageGenerator(base_url=base_url, openai_size=args.openai_size)
-    else:
-        gen = OpenRouterImageGenerator(gemini_image_size=args.gemini_image_size, openai_size=args.openai_size)
+    # 创建生成器
+    gen = ImageGenerator(base_url=args.base_url)
 
     out_dir = args.out
     Path(out_dir).mkdir(parents=True, exist_ok=True)
@@ -1041,36 +828,21 @@ def main():
             "save_path": res.get("save_path"),
             "error": res.get("error"),
             "model": res.get("model"),
-        }, ensure_ascii=False, indent=2))
-        return
-
-    if args.image2color:
-        image_path = args.image2color
-        ts = time.strftime("%Y%m%d_%H%M%S")
-        save_path = str(Path(out_dir) / f"img2color_{age_mode.value}_{orientation.value}_{ts}.png")
-        res = gen.generate_from_image(
-            image_path=image_path,
-            age_mode=age_mode,
-            orientation=orientation,
-            model=args.model,
-            save_path=save_path,
-            retry=args.retry,
-        )
-        print(json.dumps({
-            "success": res["success"],
-            "save_path": res.get("save_path"),
-            "error": res.get("error"),
-            "model": res.get("model"),
+            "api_type": res.get("api_type"),
         }, ensure_ascii=False, indent=2))
         return
 
     # 默认：提示用法
     print("用法示例：")
-    print("  python coloring_generator_v2.py --batch --model gpt5-image-mini --out output_batch")
-    print("  python coloring_generator_v2.py --generate \"A friendly dragon flying over a castle\" --kids --portrait --model nano-banana-pro")
-    print("  python coloring_generator_v2.py --image2color ./input.jpg --kids --portrait --model gpt5-image-mini")
-    print("  python coloring_generator.py --api openai --generate \"A friendly dragon\" --portrait --model gpt-image-1.5 --openai-size 1024x1536")
-    print("  python coloring_generator_v2.py --interactive")
+    print("  python coloring_generator.py --generate \"A friendly dragon\" --model gpt-image-1-mini")
+    print("  python coloring_generator.py --generate \"机器人在球场打球\" --auto")
+    print("  python coloring_generator.py --generate \"一棵圣诞树\" --model gemini-image")
+    print("  python coloring_generator.py --batch")
+    print("  python coloring_generator.py --interactive")
+    print("\n支持的模型：")
+    for name, config in MODEL_CONFIG.items():
+        if name != "default":
+            print(f"  {name}: {config['model_id']} ({config['api_type'].value})")
 
 
 if __name__ == "__main__":
