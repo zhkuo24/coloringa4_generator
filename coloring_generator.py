@@ -16,6 +16,7 @@
 """
 
 import os
+import re
 import json
 import time
 import base64
@@ -65,39 +66,22 @@ class IdeaInput:
 
 
 # ============================================================
-# 模型配置（包含 API 类型）
+# 模型配置
 # ============================================================
 
-MODEL_CONFIG = {
-    # GPT-Image 系列 - 使用 images API
-    "gpt-image-1": {
-        "model_id": "gpt-image-1",
-        "api_type": APIType.IMAGES_GENERATIONS,
-    },
-    "gpt-image-1-mini": {
-        "model_id": "gpt-image-1-mini",
-        "api_type": APIType.IMAGES_GENERATIONS,
-    },
-    "gpt-image-1.5": {
-        "model_id": "gpt-image-1.5",
-        "api_type": APIType.IMAGES_GENERATIONS,
-    },
-    # Gemini 系列 - 使用 chat API（支持 modalities）
-    "gemini-image": {
-        "model_id": "gemini-3-pro-image-preview",
-        "api_type": APIType.CHAT_COMPLETIONS,
-    },
-    # z-image - 使用 images API
-    "z-image": {
-        "model_id": "z-image",
-        "api_type": APIType.IMAGES_GENERATIONS,
-    },
+# 默认分辨率配置（GPT-Image 等模型使用）
+DEFAULT_SIZES = {"portrait": "1024x1536", "landscape": "1536x1024"}
 
-    # 默认模型
-    "default": {
-        "model_id": "gpt-image-1",
-        "api_type": APIType.IMAGES_GENERATIONS,
-    },
+# Gemini 模型专用 aspectRatio 配置
+GEMINI_ASPECT_RATIOS = {"portrait": "2:3", "landscape": "4:3"}
+
+MODEL_CONFIG = {
+    "gpt-image-1": {"model_id": "gpt-image-1", "api_type": APIType.IMAGES_GENERATIONS, "api_key_env": "OPENAI_API_KEY"},
+    "gpt-image-1-mini": {"model_id": "gpt-image-1-mini", "api_type": APIType.IMAGES_GENERATIONS, "api_key_env": "OPENAI_API_KEY"},
+    "gpt-image-1.5": {"model_id": "gpt-image-1.5", "api_type": APIType.IMAGES_GENERATIONS, "api_key_env": "OPENAI_API_KEY"},
+    "gemini-image": {"model_id": "gemini-3-pro-image-preview", "api_type": APIType.CHAT_COMPLETIONS, "api_key_env": "GEMINI_API_KEY"},
+    "z-image": {"model_id": "z-image", "api_type": APIType.IMAGES_GENERATIONS, "api_key_env": "API_KEY"},
+    "default": {"model_id": "gpt-image-1", "api_type": APIType.IMAGES_GENERATIONS, "api_key_env": "API_KEY"},
 }
 
 # ============================================================
@@ -111,125 +95,102 @@ class ColoringPromptSystem:
       - user_prompt 动态：idea + age + orientation
     """
 
-    SYSTEM_PROMPT = """You are a professional children's coloring book illustrator
-specialized in creating print-ready black-and-white coloring pages
-that children love to color.
+    SYSTEM_PROMPT = """You are a professional children's coloring-book line-art illustrator.
+You create print-ready black-and-white coloring pages that are fun, whimsical, and EASY for children to color.
 
-Your mission is to combine imagination, beauty, and clarity,
-while ALWAYS keeping the artwork easy to color and safe to print.
+NON-NEGOTIABLE OUTPUT FORMAT
+- Output MUST be a single coloring-page illustration: pure black outlines on pure white background.
+- NO text of any kind: no letters, numbers, logos, watermarks, symbols, labels, signs.
+- NO grayscale: no shading, hatching, gradients, textures, or filled black areas.
+- Uniform line weight across the entire page (print-friendly).
+- Lines must be clean, smooth, and continuous; ALL regions must be fully closed.
+- Avoid overlaps, doubled lines, tangled lines, and intersections that create tiny slivers.
+- Avoid tiny details: no thin corridors, small holes, cramped patterns, or micro-decorations.
 
-PRIORITY ORDER:
-1. Child usability and enjoyment
-2. Print safety and clarity
-3. Visual appeal and imagination
+CHILD COLORING USABILITY (HIGHEST PRIORITY)
+- Every enclosed region must be comfortably colorable.
+- Use large, simple shapes with generous spacing.
+- Prefer rounded, friendly silhouettes.
+- Keep the scene readable at a glance (clear subject + clear background).
 
-MANDATORY LINE & PRINT RULES:
-- Pure black outlines on a pure white background only
-- Clean, smooth, continuous lines
-- All shapes and regions must be fully closed
-- Uniform line thickness throughout the entire illustration
-- No filled black areas, no shading, no gradients, no textures
-- No overlapping, tangled, or doubled lines
-- No tiny gaps, thin corridors, or cramped spaces
-- No text, letters, numbers, logos, or symbols
+IMAGINATION & CHILD APPEAL
+- Mood: cheerful, playful, storybook-like.
+- Characters: friendly faces, simple expressions, gentle humor.
+- Imagination should come from the scene idea + playful props + composition,
+  NOT from dense detail or texture.
 
-DESIGN & COLORING USABILITY:
-- All coloring areas must be large and comfortable to fill
-- Prefer rounded, friendly shapes over sharp or narrow ones
-- Maintain clear spacing between separate objects
-- Every enclosed region must be safely colorable on its own
+COMPOSITION & PRINT LAYOUT
+- Balanced composition with clear white margins.
+- Fill the page naturally: no empty corners, no clutter.
+- Foreground / midground / background separation using simple shapes and spacing.
+- Include a simple “ground” and “sky” cue when appropriate.
 
-ARTISTIC & IMAGINATION DIRECTION:
-- Cheerful, playful, and storybook-like mood
-- Friendly characters with simple, expressive faces
-- Whimsical and magical feeling created through composition,
-  not through excessive detail
-- Scenes should invite curiosity, joy, and gentle imagination
-- Visual richness must remain clean, open, and uncluttered
+INTERNAL WORKFLOW (DO NOT OUTPUT THESE STEPS)
+1) Identify main subject(s) and 2–3 supporting elements that reinforce the story.
+2) Choose a clear focal point and keep background minimal but relevant.
+3) Ensure all lines close; remove any elements that would create cramped regions.
+4) Final self-check against all rules; if any rule is violated, simplify and redraw internally.
 
-COMPOSITION & LAYOUT:
-- Balanced, harmonious page composition
-- Clear white margins suitable for printing
-- Illustration should naturally fill the page without empty corners
-- Overall style should resemble high-quality professional children's coloring books
-
-FINAL SELF-CHECK BEFORE OUTPUT:
-- Every outline is closed and continuous
-- No dark or filled regions appear
-- Line weight is consistent and print-friendly
-- Complexity matches the target age group
-- The page is ready for direct printing and enjoyable coloring
+FINAL SELF-CHECK BEFORE YOU FINISH
+- Closed shapes everywhere, no gaps.
+- Consistent line thickness.
+- No filled blacks, shading, gradients, textures, or text.
+- Age-appropriate complexity and spacious coloring areas.
 """
 
     AGE_MODE_PROMPTS = {
         AgeMode.TODDLER: """[AGE MODE: TODDLER / PRESCHOOL]
 Target complexity: VERY LOW
-- 3–5 friendly objects maximum
-- Extra-large, open coloring areas
-- Thick, bold outlines
-- Wide spacing between all elements
-- Instantly recognizable subjects
+- 2–5 large, friendly objects total (including background cues)
+- Very large, open coloring regions
+- Very wide spacing; avoid small interior holes and tiny decorations
+- No patterns; no dense backgrounds; no micro-details
+- Instantly recognizable silhouettes and faces
 
 Imagination style:
-Soft, comforting, and friendly.
-Think smiling suns, fluffy clouds,
-cute animals with big eyes and simple shapes.
+Warm, comforting, cute, and simple.
+One clear "story moment" with gentle whimsy.
 """,
         AgeMode.KIDS: """[AGE MODE: KIDS]
 Target complexity: MODERATE
-- 5–10 clear objects
-- Medium to large coloring areas
-- Simple decorative elements allowed
-- Background should directly relate to the requested scene
-- Characters may show action and emotion
+- 5–10 clear objects total (foreground + a few background elements)
+- Medium-to-large coloring regions (avoid micro details)
+- Simple, BIG decorative elements allowed only if large and sparse
+- Background must directly support the theme, not compete with the subject
+- Characters may show action and emotion; keep poses readable
 
 Imagination style:
 Playful and adventurous.
-Focus on the specific theme requested by the user.
-Add only elements that logically belong to the scene.
-Decorative details must remain large and simple.
+Add 1–2 whimsical props that logically belong to the idea (no random extras).
 """
     }
 
-    ORIENTATION_PROMPTS = {
-        Orientation.PORTRAIT: """VERTICAL COMPOSITION:
-- Tall, storybook-style layout
-- Sky elements near the top
-- Ground elements near the bottom
-- Let the scene flow naturally from top to bottom
-""",
-        Orientation.LANDSCAPE: """HORIZONTAL COMPOSITION:
-- Wide, panoramic layout
-- Spread elements evenly from left to right
-- Avoid crowded or compressed areas
-""",
-        Orientation.AUTO: """AUTO COMPOSITION:
-- Naturally fill the entire page with the main subject
-- Focus on the requested elements, avoid adding unrelated objects
-- No empty corners, no clutter
-"""
-    }
+    IDEA_TO_COLORING_TEMPLATE = """Create ONE print-ready children's coloring page illustration from this idea:
 
-    IDEA_TO_COLORING_TEMPLATE = """Create a children's coloring page based on this idea:
-
+IDEA:
 {idea}
 
 {age_mode_prompt}
 
-COMPOSITION:
-{orientation_prompt}
+STORYBOOK CHARM (keep it simple):
+- Depict a single clear “story moment” that feels joyful.
+- Add 1–2 whimsical details that logically belong to the idea (no random extras).
+- Keep the scene uncluttered with spacious coloring areas.
 
-The illustration should feel joyful, imaginative,
-and visually pleasing for children.
+STRICT COLORING-PAGE RULES (must follow):
+- Pure black outlines on pure white background only.
+- Closed shapes everywhere; smooth continuous lines; uniform line weight.
+- No shading, no hatching, no gradients, no textures, no filled black areas.
+- No text/letters/numbers/logos/symbols.
+- No overlaps/tangled/doubled lines; no tiny gaps or cramped regions.
 
-Ensure the result is print-ready and easy to color.
+Deliver a clean, professional coloring-book style page that children will love.
 """
 
     def build_text_prompts(self, idea_input: IdeaInput) -> Dict[str, Any]:
         user_prompt = self.IDEA_TO_COLORING_TEMPLATE.format(
             idea=idea_input.idea.strip(),
-            age_mode_prompt=self.AGE_MODE_PROMPTS[idea_input.age_mode],
-            orientation_prompt=self.ORIENTATION_PROMPTS[idea_input.orientation],
+            age_mode_prompt=self.AGE_MODE_PROMPTS[idea_input.age_mode]
         )
         return {
             "system_prompt": self.SYSTEM_PROMPT,
@@ -237,7 +198,6 @@ Ensure the result is print-ready and easy to color.
             "meta": {
                 "mode": "text",
                 "age_mode": idea_input.age_mode.value,
-                "orientation": idea_input.orientation.value,
                 "idea": idea_input.idea,
             }
         }
@@ -252,17 +212,29 @@ class OrientationDetector:
 
     DEFAULT_MODEL = "gpt-4o-mini"
 
-    DETECTION_PROMPT = """判断这个儿童涂色卡的最佳布局方向。
+    DETECTION_PROMPT = """Determine the best page orientation (PORTRAIT or LANDSCAPE) for a children's coloring book illustration based on the likely composition.
 
-创意内容: {idea}
+Idea: {idea}
 
-只回答一个词: PORTRAIT 或 LANDSCAPE
+Decide by composition, not by object name.
 
-判断规则:
-- 宽/横向场景（球场、海洋、公路、多人并排、赛车、火车）→ LANDSCAPE
-- 高/纵向场景（树、塔、火箭、站立人物、长颈鹿、摩天大楼）→ PORTRAIT
-- 不确定时默认 → PORTRAIT
-"""
+PORTRAIT if the main subject is a single tall/vertical focus or needs top-to-bottom framing:
+- one main character centered (full body), standing pose
+- tall objects: tower, rocket, lighthouse, skyscraper, tree, giraffe, waterfall
+- scenes emphasizing height, climbing, stacked elements, vertical movement
+
+LANDSCAPE if the scene needs left-to-right space or wide background:
+- wide environments with horizon/skyline: beach/ocean, desert, mountains, sunset, city skyline
+- long paths/fields: road/highway, racetrack, runway, sports field/court, river across the scene
+- multiple subjects arranged side-by-side across the page, group activities spread horizontally
+- panoramic or “wide view” composition
+
+Conflict rule:
+- If there is a single dominant tall subject that should be the focal point, choose PORTRAIT.
+- Otherwise, if the story requires showing wide context or multiple elements across, choose LANDSCAPE.
+- If still uncertain, choose PORTRAIT.
+
+Respond with exactly one word: PORTRAIT or LANDSCAPE."""
 
     def __init__(
         self,
@@ -270,7 +242,7 @@ class OrientationDetector:
         base_url: Optional[str] = None,
         model: Optional[str] = None,
     ):
-        self.api_key = api_key or os.getenv("API_KEY")
+        self.api_key = api_key or os.getenv("OPENAI_API_KEY")
         if not self.api_key:
             raise ValueError("请设置 API_KEY 环境变量或传入 api_key 参数")
         self.base_url = (base_url or os.getenv("API_BASE_URL", "https://yunwu.ai/v1")).rstrip("/")
@@ -329,26 +301,23 @@ class ImageGenerator:
     3. 提示词系统保持不变
     """
 
-    def __init__(
-        self,
-        api_key: Optional[str] = None,
-        base_url: Optional[str] = None,
-    ):
-        self.api_key = api_key or os.getenv("API_KEY")
-        if not self.api_key:
-            raise ValueError("请设置 API_KEY 环境变量或传入 api_key 参数")
+    def __init__(self, base_url: Optional[str] = None):
         self.base_url = (base_url or os.getenv("API_BASE_URL", "https://yunwu.ai/v1")).rstrip("/")
         self.prompt_system = ColoringPromptSystem()
 
     def get_model_config(self, model: str) -> Dict[str, Any]:
-        """获取模型配置，支持直接传入完整 model_id"""
+        """获取模型配置"""
         if model in MODEL_CONFIG:
             return MODEL_CONFIG[model]
-        # 如果不在配置中，假设是完整的 model_id，默认使用 images API
-        return {
-            "model_id": model,
-            "api_type": APIType.IMAGES_GENERATIONS,
-        }
+        return {"model_id": model, "api_type": APIType.IMAGES_GENERATIONS, "api_key_env": "API_KEY"}
+
+    def _get_api_key(self, config: Dict[str, Any]) -> str:
+        """根据模型配置获取对应的 API KEY"""
+        env_name = config.get("api_key_env", "API_KEY")
+        key = os.getenv(env_name)
+        if not key:
+            raise ValueError(f"请设置 {env_name} 环境变量")
+        return key
 
     def generate_from_idea(
         self,
@@ -361,44 +330,26 @@ class ImageGenerator:
         """文生图主入口"""
         prompts = self.prompt_system.build_text_prompts(idea_input)
         config = self.get_model_config(model)
+        api_key = self._get_api_key(config)
+        # 从 idea_input 获取 orientation（由 OrientationDetector 判断）
+        orientation = idea_input.orientation.value  # "portrait" 或 "landscape"
 
         if config["api_type"] == APIType.CHAT_COMPLETIONS:
-            return self._generate_via_chat(
-                prompts=prompts,
-                model_id=config["model_id"],
-                save_path=save_path,
-                timeout_sec=timeout_sec,
-                retry=retry,
-            )
+            return self._generate_via_chat(prompts, config["model_id"], api_key, orientation, save_path, timeout_sec, retry)
         else:
-            return self._generate_via_images(
-                prompts=prompts,
-                model_id=config["model_id"],
-                save_path=save_path,
-                timeout_sec=timeout_sec,
-                retry=retry,
-            )
+            return self._generate_via_images(prompts, config["model_id"], api_key, orientation, save_path, timeout_sec, retry)
 
     # ============================================================
     # Chat Completions API (/chat/completions)
     # ============================================================
 
     def _generate_via_chat(
-        self,
-        prompts: Dict[str, Any],
-        model_id: str,
-        save_path: str,
-        timeout_sec: int,
-        retry: int,
+        self, prompts: Dict[str, Any], model_id: str, api_key: str, orientation: str, save_path: str, timeout_sec: int, retry: int
     ) -> Dict[str, Any]:
         """使用 /chat/completions 接口生成图像"""
         endpoint = f"{self.base_url}/chat/completions"
-        headers = {
-            "Authorization": f"Bearer {self.api_key}",
-            "Content-Type": "application/json",
-        }
-
-        payload = self._build_chat_payload(prompts, model_id)
+        headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+        payload = self._build_chat_payload(prompts, model_id, orientation)
 
         t0 = time.time()
         last_err = None
@@ -440,27 +391,21 @@ class ImageGenerator:
             "user_prompt_preview": prompts["user_prompt"][:500],
         }
 
-    def _build_chat_payload(
-        self,
-        prompts: Dict[str, Any],
-        model_id: str,
-    ) -> Dict[str, Any]:
-        """构建 chat/completions 请求 payload"""
-        system_msg = {"role": "system", "content": prompts["system_prompt"]}
-        user_msg = {"role": "user", "content": prompts["user_prompt"]}
-
-        payload: Dict[str, Any] = {
+    def _build_chat_payload(self, prompts: Dict[str, Any], model_id: str, orientation: str) -> Dict[str, Any]:
+        """构建 chat/completions 请求 payload（Gemini 模型使用 imageConfig）"""
+        aspect_ratio = GEMINI_ASPECT_RATIOS.get(orientation, "2:3")
+        return {
             "model": model_id,
-            "messages": [system_msg, user_msg],
+            "messages": [
+                {"role": "system", "content": prompts["system_prompt"]},
+                {"role": "user", "content": prompts["user_prompt"]},
+            ],
             "modalities": ["image", "text"],
+            "imageConfig": {
+                "aspectRatio": aspect_ratio,
+                "imageSize": "2K",
+            },
         }
-
-        # 尺寸控制
-        orientation = (prompts.get("meta", {}) or {}).get("orientation", "auto")
-        size = self._get_size_for_orientation(orientation)
-        payload["size"] = size
-
-        return payload
 
     def _extract_image_from_chat(self, result: Dict[str, Any]) -> Optional[str]:
         """从 chat/completions 响应中提取图像"""
@@ -503,6 +448,15 @@ class ImageGenerator:
                 if content.startswith("http") or content.startswith("data:image"):
                     return content
 
+                # 4) Markdown 格式图像: ![image](data:image/xxx;base64,...)
+                match = re.search(r'!\[.*?\]\((data:image/[^)]+)\)', content)
+                if match:
+                    return match.group(1)
+                # 也匹配 http URL
+                match = re.search(r'!\[.*?\]\((https?://[^)]+)\)', content)
+                if match:
+                    return match.group(1)
+
             return None
         except Exception:
             return None
@@ -512,32 +466,17 @@ class ImageGenerator:
     # ============================================================
 
     def _generate_via_images(
-        self,
-        prompts: Dict[str, Any],
-        model_id: str,
-        save_path: str,
-        timeout_sec: int,
-        retry: int,
+        self, prompts: Dict[str, Any], model_id: str, api_key: str, orientation: str, save_path: str, timeout_sec: int, retry: int
     ) -> Dict[str, Any]:
         """使用 /images/generations 接口生成图像"""
         endpoint = f"{self.base_url}/images/generations"
-        headers = {
-            "Authorization": f"Bearer {self.api_key}",
-            "Content-Type": "application/json",
-        }
-
-        meta = prompts.get("meta", {}) or {}
-        orientation = meta.get("orientation", "auto")
-        size = self._get_size_for_orientation(orientation)
-
-        # 将 system_prompt 和 user_prompt 合并为一个 prompt
-        full_prompt = f"{prompts['system_prompt']}\n\n{prompts['user_prompt']}"
+        headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
 
         payload = {
             "model": model_id,
-            "prompt": full_prompt,
+            "prompt": f"{prompts['system_prompt']}\n\n{prompts['user_prompt']}",
             "n": 1,
-            "size": size,
+            "size": DEFAULT_SIZES.get(orientation, DEFAULT_SIZES["portrait"]),
             "quality": "high",
         }
 
@@ -565,7 +504,7 @@ class ImageGenerator:
                     "api_type": "images",
                     "elapsed_sec": round(time.time() - t0, 3),
                     "save_path": save_path,
-                    "meta": meta,
+                    "meta": prompts.get("meta", {}),
                     "user_prompt_preview": prompts["user_prompt"][:500],
                 }
 
@@ -581,7 +520,7 @@ class ImageGenerator:
             "api_type": "images",
             "elapsed_sec": round(time.time() - t0, 3),
             "error": last_err,
-            "meta": meta,
+            "meta": prompts.get("meta", {}),
             "user_prompt_preview": prompts["user_prompt"][:500],
         }
 
@@ -604,13 +543,6 @@ class ImageGenerator:
     # ============================================================
     # 工具方法
     # ============================================================
-
-    def _get_size_for_orientation(self, orientation: str) -> str:
-        """根据 orientation 返回尺寸"""
-        if orientation == "landscape":
-            return "1536x1024"
-        # portrait / auto 默认竖版
-        return "1024x1536"
 
     def _save_image(self, image_data: str, save_path: str) -> None:
         """保存图像到文件"""
@@ -704,58 +636,6 @@ def run_batch(gen: ImageGenerator, cases: List[IdeaInput], model: str, out_dir: 
 
 
 # ============================================================
-# 交互模式
-# ============================================================
-
-def interactive_mode(gen: ImageGenerator, model: str, out_dir: str):
-    Path(out_dir).mkdir(parents=True, exist_ok=True)
-
-    age_mode = AgeMode.KIDS
-    orientation = Orientation.PORTRAIT
-
-    print("\n儿童涂色卡生成器 v3（统一 API 架构）")
-    print("命令：")
-    print("  toddler / kids            切换年龄")
-    print("  portrait / landscape / auto  切换方向")
-    print("  quit                      退出\n")
-
-    while True:
-        try:
-            prompt = input(f"[{age_mode.value}/{orientation.value}] Idea> ").strip()
-            if not prompt:
-                continue
-            if prompt.lower() in ("quit", "exit", "q"):
-                print("Bye.")
-                break
-            if prompt.lower() == "toddler":
-                age_mode = AgeMode.TODDLER
-                print("已切换 toddler")
-                continue
-            if prompt.lower() == "kids":
-                age_mode = AgeMode.KIDS
-                print("已切换 kids")
-                continue
-            if prompt.lower() in ("portrait", "landscape", "auto"):
-                orientation = Orientation(prompt.lower())
-                print(f"已切换 {orientation.value}")
-                continue
-
-            idea_input = IdeaInput(prompt, age_mode, orientation)
-            ts = time.strftime("%Y%m%d_%H%M%S")
-            save_path = str(Path(out_dir) / f"interactive_{age_mode.value}_{orientation.value}_{ts}.png")
-
-            res = gen.generate_from_idea(idea_input, model=model, save_path=save_path, retry=1)
-            if res["success"]:
-                print(f"生成成功: {save_path}\n")
-            else:
-                print(f"生成失败: {res['error']}\n")
-
-        except KeyboardInterrupt:
-            print("\nBye.")
-            break
-
-
-# ============================================================
 # CLI
 # ============================================================
 
@@ -809,9 +689,6 @@ def main():
         run_batch(gen, cases, args.model, out_dir, args.retry)
         return
 
-    if args.interactive:
-        interactive_mode(gen, args.model, out_dir)
-        return
 
     if args.generate:
         # 如果是 AUTO 模式，使用 OrientationDetector 自动检测
