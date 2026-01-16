@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-儿童涂色卡生成器 v3.3（提示词优化 - Modern Storybook Style）
+儿童涂色卡生成器 v3.4（新增按年龄分组批量生成）
 - 年龄分组优化：LITTLE_ONES (3-5岁) / YOUNG_ARTISTS (6岁+)
 - 新增 Modern Storybook Style 风格（Eric Carle + Richard Scarry + Pixar）
 - 量化线条、区域规范，年龄区分更明显
@@ -14,9 +14,15 @@
   API_BASE_URL=https://yunwu.ai/v1
 
 用法示例：
+  # 单张生成
   python coloring_generator.py --generate "A bunny eating carrots" --little --auto
   python coloring_generator.py --generate "A bunny eating carrots" --young --auto
   python coloring_generator.py --batch
+
+  # 按年龄分组批量生成（推荐使用 Gemini）
+  python coloring_generator.py --batch-age --model gemini-image --out output_age
+  python coloring_generator.py --batch-age --age-group 3-5years --model gemini-image
+  python coloring_generator.py --batch-age --age-group 5+years --model gemini-image
 """
 
 import os
@@ -918,6 +924,209 @@ def default_test_set() -> List[IdeaInput]:
     ]
 
 
+# ============================================================
+# 年龄分组提示词集合
+# ============================================================
+
+AGE_GROUP_PROMPTS = {
+    "3-5years": [
+        "A smiling dinosaur wearing a chef hat, baking one giant cookie in a tiny kitchen.",
+        "A fluffy bunny driving a toy car through bubble clouds with three big balloons.",
+        "A friendly whale floating in the sky like a blimp, carrying a tiny house on its back.",
+        "A kitten astronaut standing on the moon holding a star-shaped flag, with one big planet behind.",
+        "A happy turtle with a small flower garden growing on its shell.",
+        "A tiny dragon sleeping on a pillow made of marshmallows under a big moon and a few stars.",
+        "A bear riding a giant pencil like a rocket, leaving a simple rainbow trail.",
+        "A duck wearing rain boots jumping into one big puddle with cheerful splashes.",
+        "A smiling sun giving an ice cream to a little cloud friend.",
+        "A unicorn brushing its mane in a cozy room with a bed and one window.",
+        "A little elephant watering one giant flower with a small watering can.",
+        "A friendly robot hugging a teddy bear with a big happy face.",
+        "A strawberry-shaped house with a door and two windows, a path, and two butterflies.",
+        "A penguin having a tea party with two cupcakes on a big round table.",
+        "A lion with a fluffy cloud-like mane standing on grass near one big tree.",
+        "A snail carrying a tiny castle on its shell, smiling proudly.",
+        "A cheerful octopus juggling four big beach balls in the center.",
+        "A giraffe wearing a scarf looking at one big butterfly hovering nearby.",
+        "A tiny fairy riding a ladybug above one big flower.",
+        "A friendly shark playing a ukulele underwater next to one coral and one fish.",
+    ],
+    "5+years": [
+        "A hot-air balloon shaped like a giant teapot floating over a whimsical town.",
+        "A dragon librarian in a grand library organizing flying books and scrolls.",
+        "An underwater coral city with tiny submarine buses and fish-shaped traffic lights, a diver waving.",
+        "A giant treehouse village connected by rope bridges, squirrels delivering mail between houses.",
+        "A moon carnival where astronauts ride a Ferris wheel made of stars, with rocket booths nearby.",
+        "A cat-run bakery where donuts float like planets around a cosmic oven, sprinkles falling like meteors.",
+        "A friendly monster school classroom with backpacks, a chalkboard, and silly science experiments.",
+        "A magical train traveling through a waterfall tunnel with glowing lanterns and animal-shaped luggage.",
+        "A floating island farm with windmills, cloud sheep, and a rainbow river winding through fields.",
+        "A robot gardener growing geometric flowers in a greenhouse, with tiny watering drones.",
+        "A castle kitchen where pots and pans dance while a young wizard stirs starry soup.",
+        "A submarine treasure hunt with a map, an ancient shipwreck, and friendly sea creatures guiding the way.",
+        "A snowy mountain ski resort run by penguins, with lifts, cabins, and a hot cocoa stand.",
+        "A candy jungle with lollipop trees and chocolate rocks, explorers crossing a syrup river on wafer rafts.",
+        "A space aquarium with glass tunnels, giant jellyfish floating above, and a family of aliens visiting.",
+        "A medieval festival where knights ride giant snails, with banners, stalls, and a playful crowd cheering.",
+        "A wizard's workshop filled with potion bottles, gears, a talking clock, and a tiny dragon assistant.",
+        "A sky harbor where airships dock, suitcases roll by themselves, and clouds look like animals.",
+        "A deep-sea neighborhood where a giant octopus mail carrier delivers letters to coral houses.",
+        "A fantasy city street where shadows become playful pet animals, kids chasing their shadow pets under glowing lanterns.",
+    ],
+}
+
+
+def run_batch_by_age_groups(
+    gen: ImageGenerator,
+    model: str,
+    out_dir: str,
+    retry: int,
+    age_groups: Optional[List[str]] = None,
+    start_index: int = 1,
+) -> Dict[str, Any]:
+    """
+    按年龄分组批量生成涂色卡
+
+    Args:
+        gen: ImageGenerator 实例
+        model: 模型名称
+        out_dir: 输出根目录
+        retry: 重试次数
+        age_groups: 要生成的年龄组列表，默认全部
+        start_index: 起始序号（用于续传）
+
+    Output Structure:
+        out_dir/
+        ├── 3-5years/
+        │   ├── 001_dinosaur_chef_20260116_120000.png
+        │   ├── 001_dinosaur_chef_20260116_120000.json
+        │   └── ...
+        ├── 5+years/
+        │   ├── 001_teapot_balloon_20260116_120100.png
+        │   └── ...
+        └── _summary.json
+    """
+    if age_groups is None:
+        age_groups = list(AGE_GROUP_PROMPTS.keys())
+
+    Path(out_dir).mkdir(parents=True, exist_ok=True)
+    all_results: Dict[str, List[Dict[str, Any]]] = {}
+    total_count = 0
+    success_count = 0
+    failed_count = 0
+
+    for age_group in age_groups:
+        if age_group not in AGE_GROUP_PROMPTS:
+            print(f"[Warning] Unknown age group: {age_group}, skipping...")
+            continue
+
+        prompts = AGE_GROUP_PROMPTS[age_group]
+        age_mode = AgeMode.LITTLE_ONES if age_group == "3-5years" else AgeMode.YOUNG_ARTISTS
+
+        # 创建年龄组子目录
+        group_dir = Path(out_dir) / age_group
+        group_dir.mkdir(parents=True, exist_ok=True)
+
+        results: List[Dict[str, Any]] = []
+        print(f"\n{'='*60}")
+        print(f"Age Group: {age_group} ({len(prompts)} prompts)")
+        print(f"Age Mode: {age_mode.value}")
+        print(f"Output: {group_dir}")
+        print(f"{'='*60}")
+
+        for idx, prompt in enumerate(prompts, start=start_index):
+            total_count += 1
+            ts = time.strftime("%Y%m%d_%H%M%S")
+
+            # 生成简短文件名（取 prompt 前几个单词）
+            words = prompt.split()[:3]
+            slug = "_".join(w.lower().strip(".,!?") for w in words if w.isalnum() or w.replace("-", "").isalnum())[:30]
+            stem = f"{idx:03d}_{slug}_{ts}"
+            png_path = str(group_dir / f"{stem}.png")
+            json_path = str(group_dir / f"{stem}.json")
+
+            print(f"\n[{age_group}] [{idx}/{len(prompts)}] model={model}")
+            print(f"  prompt: {prompt[:80]}...")
+
+            # 创建 IdeaInput，使用 AUTO 方向自动检测
+            idea_input = IdeaInput(prompt, age_mode, Orientation.AUTO)
+
+            # AUTO 模式先检测方向
+            try:
+                detector = OrientationDetector()
+                detected = detector.detect(prompt)
+                idea_input = IdeaInput(prompt, age_mode, detected)
+            except Exception as e:
+                print(f"  [OrientationDetector] 检测失败，使用默认 PORTRAIT: {e}")
+                idea_input = IdeaInput(prompt, age_mode, Orientation.PORTRAIT)
+
+            res = gen.generate_from_idea(
+                idea_input=idea_input,
+                model=model,
+                save_path=png_path,
+                retry=retry,
+            )
+
+            # 添加额外元数据
+            res["age_group"] = age_group
+            res["prompt_index"] = idx
+            res["original_prompt"] = prompt
+
+            with open(json_path, "w", encoding="utf-8") as f:
+                json.dump(res, f, ensure_ascii=False, indent=2)
+
+            if res["success"]:
+                success_count += 1
+                print(f"  ✓ OK   -> {res['save_path']} ({res['elapsed_sec']}s)")
+            else:
+                failed_count += 1
+                print(f"  ✗ FAIL -> {res.get('error', 'Unknown error')} ({res['elapsed_sec']}s)")
+
+            results.append(res)
+
+        all_results[age_group] = results
+
+        # 保存年龄组小结
+        group_summary = {
+            "age_group": age_group,
+            "total": len(results),
+            "success": sum(1 for r in results if r.get("success")),
+            "failed": sum(1 for r in results if not r.get("success")),
+            "model": model,
+            "time": time.strftime("%Y-%m-%d %H:%M:%S"),
+        }
+        with open(str(group_dir / "_summary.json"), "w", encoding="utf-8") as f:
+            json.dump(group_summary, f, ensure_ascii=False, indent=2)
+
+    # 保存总汇总
+    summary = {
+        "total": total_count,
+        "success": success_count,
+        "failed": failed_count,
+        "model": model,
+        "out_dir": out_dir,
+        "age_groups": {
+            ag: {
+                "total": len(all_results.get(ag, [])),
+                "success": sum(1 for r in all_results.get(ag, []) if r.get("success")),
+                "failed": sum(1 for r in all_results.get(ag, []) if not r.get("success")),
+            }
+            for ag in age_groups if ag in all_results
+        },
+        "time": time.strftime("%Y-%m-%d %H:%M:%S"),
+    }
+
+    with open(str(Path(out_dir) / "_summary.json"), "w", encoding="utf-8") as f:
+        json.dump(summary, f, ensure_ascii=False, indent=2)
+
+    print("\n" + "="*60)
+    print("BATCH GENERATION COMPLETE")
+    print("="*60)
+    print(json.dumps(summary, ensure_ascii=False, indent=2))
+
+    return summary
+
+
 def run_batch(gen: ImageGenerator, cases: List[IdeaInput], model: str, out_dir: str, retry: int) -> Dict[str, Any]:
     """批量运行测试集"""
     Path(out_dir).mkdir(parents=True, exist_ok=True)
@@ -989,6 +1198,12 @@ def parse_args():
     p.add_argument("--generate", type=str, default=None, help="输入 idea 生成涂色卡")
     p.add_argument("--batch", action="store_true", help="跑默认批量测试集")
 
+    # 按年龄分组批量生成
+    p.add_argument("--batch-age", action="store_true", help="按年龄分组批量生成（3-5岁、5+岁）")
+    p.add_argument("--age-group", type=str, default=None,
+                   help="指定年龄组: 3-5years, 5+years (可用逗号分隔多个，默认全部)")
+    p.add_argument("--start-index", type=int, default=1, help="起始序号（用于续传）")
+
     # 年龄模式：新参数
     p.add_argument("--little", action="store_true", help="3-5岁模式 (little_ones)")
     p.add_argument("--young", action="store_true", help="6岁+模式 (young_artists，默认)")
@@ -1025,6 +1240,21 @@ def main():
     gen = ImageGenerator(base_url=args.base_url)
     out_dir = args.out
     Path(out_dir).mkdir(parents=True, exist_ok=True)
+
+    # 按年龄分组批量生成
+    if args.batch_age:
+        age_groups = None
+        if args.age_group:
+            age_groups = [g.strip() for g in args.age_group.split(",")]
+        run_batch_by_age_groups(
+            gen=gen,
+            model=args.model,
+            out_dir=out_dir,
+            retry=args.retry,
+            age_groups=age_groups,
+            start_index=args.start_index,
+        )
+        return
 
     if args.batch:
         cases = default_test_set()
@@ -1066,6 +1296,14 @@ def main():
     print('  python coloring_generator.py --generate "A friendly dragon" --auto')
     print('  python coloring_generator.py --generate "海盗猫的冒险" --young --landscape')
     print("  python coloring_generator.py --batch")
+    print("\n按年龄分组批量生成：")
+    print("  python coloring_generator.py --batch-age --model gemini-image --out output_age")
+    print("  python coloring_generator.py --batch-age --age-group 3-5years --model gemini-image")
+    print("  python coloring_generator.py --batch-age --age-group 5+years --model gemini-image")
+    print("  python coloring_generator.py --batch-age --age-group 3-5years,5+years --start-index 5")
+    print("\n可用年龄组：")
+    for group, prompts in AGE_GROUP_PROMPTS.items():
+        print(f"  {group}: {len(prompts)} 个提示词")
     print("\n支持的模型：")
     for name, config in MODEL_CONFIG.items():
         if name != "default":
