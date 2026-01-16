@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-儿童涂色卡生成器 v3.4（新增按年龄分组批量生成）
+儿童涂色卡生成器 v3.5（新增 A4 PDF 自动生成）
+- 生成 PNG 后自动转换为 A4 PDF (300 DPI)
 - 年龄分组优化：LITTLE_ONES (3-5岁) / YOUNG_ARTISTS (6岁+)
-- 新增 Modern Storybook Style 风格（Eric Carle + Richard Scarry + Pixar）
-- 量化线条、区域规范，年龄区分更明显
+- Modern Storybook Style 风格（Eric Carle + Richard Scarry + Pixar）
 - 支持三种 API 格式：
   - /chat/completions（OpenAI 兼容格式）
   - /images/generations（GPT-Image、DALL-E）
@@ -14,10 +14,9 @@
   API_BASE_URL=https://yunwu.ai/v1
 
 用法示例：
-  # 单张生成
+  # 单张生成（自动生成 PNG + PDF）
   python coloring_generator.py --generate "A bunny eating carrots" --little --auto
   python coloring_generator.py --generate "A bunny eating carrots" --young --auto
-  python coloring_generator.py --batch
 
   # 按年龄分组批量生成（推荐使用 Gemini）
   python coloring_generator.py --batch-age --model gemini-image --out output_age
@@ -90,6 +89,136 @@ MODEL_CONFIG = {
     "gemini-image": {"model_id": "gemini-3-pro-image-preview", "api_type": APIType.GEMINI_NATIVE, "api_key_env": "GEMINI_API_KEY"},
     "default": {"model_id": "gpt-image-1", "api_type": APIType.IMAGES_GENERATIONS, "api_key_env": "API_KEY"},
 }
+
+
+# ============================================================
+# A4 尺寸转换（PNG + PDF）
+# ============================================================
+
+def resize_to_a4(png_path: str, dpi: int = 300) -> Optional[str]:
+    """
+    将 PNG 调整为 A4 尺寸（覆盖原文件）
+
+    Args:
+        png_path: PNG 文件路径
+        dpi: 目标 DPI（默认 300）
+
+    Returns:
+        成功返回 png_path，失败返回 None
+
+    A4 尺寸参考:
+        210mm × 297mm
+        @ 300 DPI: Portrait 2480×3508, Landscape 3508×2480
+    """
+    try:
+        from PIL import Image
+    except ImportError:
+        print("  [A4] 警告: Pillow 未安装，无法调整尺寸")
+        return None
+
+    try:
+        img = Image.open(png_path)
+        original_size = f"{img.width}x{img.height}"
+        is_landscape = img.width > img.height
+
+        # A4 @ 300 DPI
+        if is_landscape:
+            a4_w = round(297 * dpi / 25.4)  # 3508
+            a4_h = round(210 * dpi / 25.4)  # 2480
+        else:
+            a4_w = round(210 * dpi / 25.4)  # 2480
+            a4_h = round(297 * dpi / 25.4)  # 3508
+
+        # 按比例缩放到 A4
+        ratio = min(a4_w / img.width, a4_h / img.height)
+        new_w = int(img.width * ratio)
+        new_h = int(img.height * ratio)
+        img_resized = img.resize((new_w, new_h), Image.Resampling.LANCZOS)
+
+        # 居中放置在白色 A4 背景
+        a4_img = Image.new("RGB", (a4_w, a4_h), "white")
+        x = (a4_w - new_w) // 2
+        y = (a4_h - new_h) // 2
+
+        # 处理透明通道
+        if img_resized.mode == "RGBA":
+            a4_img.paste(img_resized, (x, y), img_resized)
+        else:
+            if img_resized.mode != "RGB":
+                img_resized = img_resized.convert("RGB")
+            a4_img.paste(img_resized, (x, y))
+
+        # 覆盖保存 PNG
+        a4_img.save(png_path, "PNG")
+
+        orientation = "landscape" if is_landscape else "portrait"
+        print(f"  [A4] PNG {original_size} -> {a4_w}x{a4_h} ({orientation})")
+        return png_path
+
+    except Exception as e:
+        print(f"  [A4] PNG 调整失败: {e}")
+        return None
+
+
+def convert_to_a4_pdf(png_path: str, pdf_path: Optional[str] = None, dpi: int = 300) -> Optional[str]:
+    """
+    将 PNG 转换为 A4 PDF（假设 PNG 已经是 A4 尺寸）
+
+    Args:
+        png_path: PNG 文件路径（应已是 A4 尺寸）
+        pdf_path: PDF 输出路径（默认与 PNG 同名）
+        dpi: 输出 DPI（默认 300）
+
+    Returns:
+        PDF 文件路径，失败返回 None
+    """
+    try:
+        from PIL import Image
+    except ImportError:
+        print("  [PDF] 警告: Pillow 未安装，无法生成 PDF")
+        return None
+
+    if pdf_path is None:
+        pdf_path = png_path.rsplit(".", 1)[0] + ".pdf"
+
+    try:
+        img = Image.open(png_path)
+        if img.mode != "RGB":
+            img = img.convert("RGB")
+
+        # 保存为 PDF
+        img.save(pdf_path, "PDF", resolution=dpi)
+        print(f"  [PDF] -> {pdf_path}")
+        return pdf_path
+
+    except Exception as e:
+        print(f"  [PDF] 生成失败: {e}")
+        return None
+
+
+def process_to_a4(png_path: str, dpi: int = 300) -> Dict[str, Optional[str]]:
+    """
+    完整的 A4 处理流程：调整 PNG 尺寸 + 生成 PDF
+
+    Args:
+        png_path: PNG 文件路径
+        dpi: 目标 DPI（默认 300）
+
+    Returns:
+        {"png_path": str|None, "pdf_path": str|None}
+    """
+    result = {"png_path": None, "pdf_path": None}
+
+    # 1. 调整 PNG 到 A4 尺寸
+    if resize_to_a4(png_path, dpi):
+        result["png_path"] = png_path
+
+        # 2. 生成 PDF
+        pdf_path = convert_to_a4_pdf(png_path, dpi=dpi)
+        if pdf_path:
+            result["pdf_path"] = pdf_path
+
+    return result
 
 
 # ============================================================
@@ -488,7 +617,7 @@ Respond with exactly one word: PORTRAIT or LANDSCAPE."""
             resp.raise_for_status()
             result = resp.json()
             answer = result["choices"][0]["message"]["content"].strip().upper()
-
+            print(f"[OrientationDetector] LLM answer: {answer}")
             if "LANDSCAPE" in answer:
                 print(f"[OrientationDetector] idea=\"{idea}\" → LANDSCAPE")
                 return Orientation.LANDSCAPE
@@ -550,12 +679,20 @@ class ImageGenerator:
         orientation = idea_input.orientation.value
 
         if config["api_type"] == APIType.CHAT_COMPLETIONS:
-            return self._generate_via_chat(prompts, config["model_id"], api_key, orientation, save_path, timeout_sec, retry)
+            result = self._generate_via_chat(prompts, config["model_id"], api_key, orientation, save_path, timeout_sec, retry)
         elif config["api_type"] == APIType.GEMINI_NATIVE:
             print(f"Using Gemini Native API for model {config['model_id']}")
-            return self._generate_via_gemini(prompts, config["model_id"], api_key, orientation, save_path, timeout_sec, retry)
+            result = self._generate_via_gemini(prompts, config["model_id"], api_key, orientation, save_path, timeout_sec, retry)
         else:
-            return self._generate_via_images(prompts, config["model_id"], api_key, orientation, save_path, timeout_sec, retry)
+            result = self._generate_via_images(prompts, config["model_id"], api_key, orientation, save_path, timeout_sec, retry)
+
+        # 成功后自动调整为 A4 尺寸（PNG + PDF）
+        if result.get("success") and result.get("save_path"):
+            a4_result = process_to_a4(result["save_path"])
+            if a4_result.get("pdf_path"):
+                result["pdf_path"] = a4_result["pdf_path"]
+
+        return result
 
     # ============================================================
     # Chat Completions API (/chat/completions)
@@ -1077,7 +1214,8 @@ def run_batch_by_age_groups(
 
             if res["success"]:
                 success_count += 1
-                print(f"  ✓ OK   -> {res['save_path']} ({res['elapsed_sec']}s)")
+                pdf_info = f" + PDF" if res.get("pdf_path") else ""
+                print(f"  ✓ OK   -> {res['save_path']}{pdf_info} ({res['elapsed_sec']}s)")
             else:
                 failed_count += 1
                 print(f"  ✗ FAIL -> {res.get('error', 'Unknown error')} ({res['elapsed_sec']}s)")
@@ -1162,9 +1300,10 @@ def run_batch(gen: ImageGenerator, cases: List[IdeaInput], model: str, out_dir: 
             json.dump(res, f, ensure_ascii=False, indent=2)
 
         if res["success"]:
-            print(f"  OK   -> {res['save_path']} ({res['elapsed_sec']}s)")
+            pdf_info = f" + PDF" if res.get("pdf_path") else ""
+            print(f"  ✓ OK   -> {res['save_path']}{pdf_info} ({res['elapsed_sec']}s)")
         else:
-            print(f"  FAIL -> {res['error']} ({res['elapsed_sec']}s)")
+            print(f"  ✗ FAIL -> {res['error']} ({res['elapsed_sec']}s)")
         results.append(res)
 
     summary = {
@@ -1189,7 +1328,7 @@ def run_batch(gen: ImageGenerator, cases: List[IdeaInput], model: str, out_dir: 
 # ============================================================
 
 def parse_args():
-    p = argparse.ArgumentParser(description="儿童涂色卡生成器 v3.3 - Modern Storybook Style")
+    p = argparse.ArgumentParser(description="儿童涂色卡生成器 v3.5 - Modern Storybook Style")
     p.add_argument("--model", default="gpt-image-1-mini", help="模型别名或完整 model id")
     p.add_argument("--out", default="output_v3", help="输出目录")
     p.add_argument("--retry", type=int, default=1, help="每条用例重试次数")
@@ -1285,7 +1424,7 @@ def main():
 
     # 默认：提示用法
     print("=" * 60)
-    print("儿童涂色卡生成器 v3.3")
+    print("儿童涂色卡生成器 v3.5")
     print("=" * 60)
     print("\n年龄模式：")
     print("  --little  3-5岁模式 (little_ones): 极简、大区域、粗线条")
