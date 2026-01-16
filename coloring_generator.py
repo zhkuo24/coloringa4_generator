@@ -1,21 +1,21 @@
 #!/usr/bin/env python3
 """
-儿童涂色卡生成器 v3.2（支持 Gemini 原生 API）
+儿童涂色卡生成器 v3.3（提示词优化 - Modern Storybook Style）
+- 年龄分组优化：LITTLE_ONES (3-5岁) / YOUNG_ARTISTS (6岁+)
+- 新增 Modern Storybook Style 风格（Eric Carle + Richard Scarry + Pixar）
+- 量化线条、区域规范，年龄区分更明显
 - 支持三种 API 格式：
   - /chat/completions（OpenAI 兼容格式）
   - /images/generations（GPT-Image、DALL-E）
   - /v1beta/models/{model}:generateContent（Gemini 原生格式）
-- 根据模型配置自动选择 API 类型
-- 支持切换不同 API 平台（通过 base_url）
-- 提示词系统优化：故事优先，规则护航
 
 环境变量：
   API_KEY=xxxx
   API_BASE_URL=https://yunwu.ai/v1
 
 用法示例：
-  python coloring_generator.py --generate "A friendly dragon" --model gpt-image-1-mini
-  python coloring_generator.py --generate "机器人在球场打球" --model gemini-image --auto
+  python coloring_generator.py --generate "A bunny eating carrots" --little --auto
+  python coloring_generator.py --generate "A bunny eating carrots" --young --auto
   python coloring_generator.py --batch
 """
 
@@ -45,8 +45,8 @@ except Exception:
 # ============================================================
 
 class AgeMode(Enum):
-    TODDLER = "toddler"
-    KIDS = "kids"
+    LITTLE_ONES = "little_ones"      # 3-5岁
+    YOUNG_ARTISTS = "young_artists"  # 6岁+
 
 
 class Orientation(Enum):
@@ -66,7 +66,7 @@ class APIType(Enum):
 class IdeaInput:
     """单输入 idea 模式"""
     idea: str
-    age_mode: AgeMode = AgeMode.KIDS
+    age_mode: AgeMode = AgeMode.YOUNG_ARTISTS
     orientation: Orientation = Orientation.AUTO
 
 
@@ -103,10 +103,27 @@ class ColoringPromptSystem:
 Your pages have appeared in countless nurseries and classrooms because children LOVE them.
 
 ═══════════════════════════════════════════════════════════════
+YOUR VISUAL STYLE: MODERN STORYBOOK
+═══════════════════════════════════════════════════════════════
+Your style blends the best of Western children's book illustration:
+
+VISUAL REFERENCES (internalize these aesthetics):
+  • Eric Carle: Bold simplicity, clear outlines, large colorable areas
+  • Richard Scarry: Warmth, personality, gentle storytelling
+  • Pixar character design: Exaggerated expressions, big friendly eyes
+
+CORE AESTHETIC PRINCIPLES:
+  ✓ ROUNDED & FRIENDLY: Soft curves, avoid sharp angles
+  ✓ CHUBBY & HUGGABLE: Pleasantly plump proportions, big heads, big eyes
+  ✓ CLEAR HIERARCHY: One star, supporting cast, simple background
+  ✓ BREATHING ROOM: White space is design, not emptiness to fill
+  ✓ EXPRESSIVE FACES: Large eyes that show emotion, simple curved smiles
+
+═══════════════════════════════════════════════════════════════
 YOUR CREATIVE MISSION
 ═══════════════════════════════════════════════════════════════
 You tell tiny visual stories that make children smile, wonder, or giggle.
-Every page is a "frozen moment" from an imaginary adventure — 
+Every page is a "frozen moment" from an imaginary adventure —
 a scene so inviting that children can't wait to bring it to life with their crayons.
 
 ═══════════════════════════════════════════════════════════════
@@ -117,31 +134,31 @@ These are your creative ingredients. Mix them to spark joy:
 SCALE PLAY
   - Tiny creature in a huge world (mouse exploring a teacup forest)
   - Giant friend in a small space (friendly elephant squeezed in a bathtub)
-  
-GENTLE MISCHIEF  
+
+GENTLE MISCHIEF
   - A character doing something slightly silly or unexpected
   - Playful rule-breaking that feels innocent, not naughty
-  
+
 COZY MAGIC
   - Everyday objects with a touch of wonder (books that grow flowers)
   - Familiar scenes with one magical twist
-  
+
 FRIENDSHIP MOMENTS
   - Two unlikely friends sharing something
   - A helping hand, a shared umbrella, a gift being given
-  
+
 JOURNEY & DISCOVERY
   - A path leading somewhere mysterious
   - An open door, a treasure map, a distant destination
   - Someone peeking around a corner or over a hill
-  
+
 EXPRESSIVE CHARACTERS
   - Clear emotions through pose: leaning in curiosity, jumping for joy
   - Body language that tells the story without words
   - Eyes looking AT something interesting (guides viewer's attention)
 
 ═══════════════════════════════════════════════════════════════
-VISUAL COMPOSITION PRINCIPLES  
+VISUAL COMPOSITION PRINCIPLES
 ═══════════════════════════════════════════════════════════════
 HIERARCHY
   - One clear STAR of the scene (largest, most central, most detailed)
@@ -155,7 +172,7 @@ BREATHING ROOM
 
 DEPTH WITHOUT COMPLEXITY
   - Simple overlap: foreground partially covers background
-  - Size difference: closer = bigger, farther = smaller  
+  - Size difference: closer = bigger, farther = smaller
   - Ground line or horizon gives spatial anchor
 
 SILHOUETTE TEST
@@ -165,7 +182,7 @@ SILHOUETTE TEST
 ═══════════════════════════════════════════════════════════════
 COLORING-FRIENDLY EXECUTION (Technical Guardrails)
 ═══════════════════════════════════════════════════════════════
-These rules protect the child's coloring experience. 
+These rules protect the child's coloring experience.
 They are constraints that ENABLE creativity, not limit it.
 
 LINE WORK
@@ -173,13 +190,13 @@ LINE WORK
   ✓ Uniform line weight throughout (consistent stroke width)
   ✓ Smooth, continuous curves; confident strokes
   ✓ ALL shapes fully closed (no gaps where color could "leak")
-  
-COLORABILITY  
+
+COLORABILITY
   ✓ Every enclosed region is comfortably large enough to color
   ✓ Generous spacing between lines (small hands need room)
   ✓ Rounded, friendly forms preferred over sharp angles
   ✓ Clear distinction between coloring regions
-  
+
 ABSOLUTE RESTRICTIONS
   ✗ No shading, hatching, gradients, or gray tones
   ✗ No filled black areas (everything should be colorable)
@@ -189,96 +206,132 @@ ABSOLUTE RESTRICTIONS
   ✗ No tiny details smaller than a crayon tip could color
 
 ═══════════════════════════════════════════════════════════════
-INTERNAL QUALITY CHECK (before finalizing)
+COLORING-FRIENDLY CHECKLIST (before finalizing)
 ═══════════════════════════════════════════════════════════════
 Ask yourself:
   □ Is there a clear "story" a child could describe in one sentence?
-  □ Would a 4-year-old know exactly what to color first?
+  □ Would a child know exactly what to color first?
   □ Are ALL regions closed and large enough for small hands?
+  □ Are all shapes ROUNDED and FRIENDLY (no sharp angles)?
+  □ Is the character CHUBBY and HUGGABLE looking?
+  □ Does the page have enough WHITE SPACE (not crowded)?
   □ Does it make you smile?
 """
 
     AGE_MODE_PROMPTS = {
-        AgeMode.TODDLER: """
+        AgeMode.LITTLE_ONES: """
 ╔═══════════════════════════════════════════════════════════════╗
-║  AGE MODE: TODDLER & PRESCHOOL (Ages 2-4)                     ║
+║  AGE MODE: LITTLE ONES (Ages 3-5)                             ║
 ╚═══════════════════════════════════════════════════════════════╝
 
-STORY STYLE: Comfort, Recognition & Gentle Wonder
+DESIGN PHILOSOPHY: "One Hero + Minimal World"
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-Toddlers love seeing FAMILIAR things in GENTLY magical ways.
-The joy comes from recognition + a small surprise.
+Think of it as: ONE main character that a 3-year-old could color
+with just 3 crayons and still feel proud.
 
-STORY INSPIRATIONS:
-  • A teddy bear having a tea party
-  • A bunny wearing rain boots, splashing in puddles  
-  • A kitten napping inside a cozy mitten
-  • A friendly sun peeking over a hill saying good morning
-  • A baby elephant giving flowers to mama elephant
-  
-EMOTIONAL TONE:
-  • "Goodnight Moon" energy: cozy, warm, safe
-  • Big friendly faces with clear, simple emotions (happy, sleepy, curious)
+WESTERN STORYBOOK CHARACTER EXAMPLES:
+  • Chubby teddy bear with big round belly
+  • Plump bunny with floppy ears
+  • Roly-poly puppy with oversized paws
+  • Squishy kitten curled up in a ball
+  • Round-faced duckling with tiny wings
+
+EMOTIONAL TONE: Warm, Safe, Familiar
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  • "Goodnight Moon" energy: cozy, gentle, reassuring
+  • Characters look like stuffed animals they'd want to hug
+  • Simple emotions: happy, sleepy, curious, surprised
   • Nothing scary, chaotic, or overwhelming
-  • Huggable characters they'd want as stuffed animals
 
-VISUAL COMPLEXITY: VERY LOW
-━━━━━━━━━━━━━━━━━━━━━━━━━━━
-  • 3-5 large, clearly separated objects TOTAL
-  • Very large, open coloring regions (think: entire belly, entire cloud)
-  • Extra-wide spacing between all elements
-  • Round, soft, blob-like shapes preferred
-  • Faces should be BIG with simple features (dot eyes, curved smile)
-  • No interior patterns or decorative details
-  • Background: minimal or none (solid ground + sky cue is enough)
+VISUAL SPECIFICATIONS (STRICT)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ELEMENT COUNT:
+  • MAXIMUM 3-5 large elements total on the page
+  • Each coloring region must be ≥8% of page area
 
-SILHOUETTE RULE:
-  A toddler should recognize the main character even as a solid black shape.
+LINE WEIGHT:
+  • BOLD, thick outlines throughout
+  • Consistent heavy stroke weight
+
+SHAPES:
+  • 100% rounded, curved shapes — NO sharp angles
+  • Chubby, puffy, blob-like forms
+  • Think: circles, ovals, soft curves only
+
+INTERIOR DETAILS:
+  • FORBIDDEN: No patterns, textures, or internal lines
+  • Faces: Simple dot eyes + curved smile only
+  • Bodies: Solid colorable areas, no stripes/spots/decorations
+
+BACKGROUND:
+  • MINIMAL or NONE
+  • At most: simple ground line + 1-2 tiny decorations (single flower, small cloud)
+  • Background elements must be much smaller than main character
+
+THE 3-CRAYON TEST:
+  Could a 3-year-old complete this page with just 3 different crayons
+  and feel satisfied? If not, simplify further.
 """,
 
-        AgeMode.KIDS: """
+        AgeMode.YOUNG_ARTISTS: """
 ╔═══════════════════════════════════════════════════════════════╗
-║  AGE MODE: KIDS (Ages 5-8)                                    ║
+║  AGE MODE: YOUNG ARTISTS (Ages 6+)                            ║
 ╚═══════════════════════════════════════════════════════════════╝
 
-STORY STYLE: Adventure, Humor & "What Happens Next?"
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-Kids this age love ACTION, JOKES, and IMAGINATION.
-They want to see characters DOING things, not just posing.
+DESIGN PHILOSOPHY: "Character DOING Something"
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+The focus shifts from "what is it?" to "what is happening?"
+These kids want ACTION, HUMOR, and STORY.
 
-STORY INSPIRATIONS:
+NARRATIVE INSPIRATIONS:
   • A pirate cat sailing a paper boat in a bathtub ocean
-  • A dragon who's afraid of a tiny butterfly
-  • A robot learning to ride a bicycle (wobbly!)
-  • A wizard's spell gone hilariously wrong (frog in the soup!)
-  • An astronaut having a picnic on the moon with alien friends
+  • A dragon who's terrified of a tiny butterfly
+  • A robot learning to ride a bicycle (wobbling!)
+  • A wizard whose spell went hilariously wrong
+  • An astronaut having a picnic with alien friends
   • A superhero whose cape got stuck in a door
-  
-NARRATIVE TECHNIQUES:
-  • Mid-action freeze: character caught in the middle of doing something
+
+STORYTELLING TECHNIQUES:
+  • Mid-action freeze: caught in the middle of doing something
   • Visual humor: mild absurdity that makes kids giggle
-  • "What happens next?" tension: something about to happen
-  • Role reversal: small creature being brave, big creature being shy
+  • "What happens next?" tension
+  • Role reversal: tiny creature being brave, big creature being shy
   • Problem-solving moment: character figuring something out
 
 EMOTIONAL RANGE:
-  • Excitement, determination, surprise, mischief, pride
-  • Characters can show effort, concentration, slight worry (resolved)
-  • Friendships with personality differences (brave one + shy one)
+  • Excitement, determination, surprise, mischief, pride, silliness
+  • Characters can show effort, concentration, playful worry
+  • Dynamic expressions: determined squint, excited grin, surprised gasp
 
-VISUAL COMPLEXITY: MODERATE
-━━━━━━━━━━━━━━━━━━━━━━━━━━━
-  • 6-12 distinct elements total (foreground + meaningful background)
-  • Medium-to-large coloring regions (still no micro-details)
-  • Dynamic poses allowed: running, jumping, reaching, flying
-  • Simple background elements that SUPPORT the story context
-  • 1-2 larger decorative elements allowed (but purposeful, not random)
-  • Characters can have simple accessories (hat, tool, bag)
-  • Expressions can be more nuanced (determined squint, excited grin)
+VISUAL SPECIFICATIONS
+━━━━━━━━━━━━━━━━━━━━━
+ELEMENT COUNT:
+  • 6-12 distinct elements total
+  • Each coloring region must be ≥3% of page area
 
-BACKGROUND GUIDANCE:
-  Background should answer "where is this happening?" without overwhelming.
-  A few simple shapes suggesting location (trees, clouds, furniture outlines).
+LINE WEIGHT:
+  • Medium-weight outlines (thinner than LITTLE_ONES but still clear)
+  • Consistent stroke width throughout
+
+SHAPES:
+  • 80% curved + 20% simple geometric shapes allowed
+  • Still predominantly friendly and rounded
+  • Dynamic poses: running, jumping, reaching, flying
+
+INTERIOR DETAILS:
+  • ALLOWED: Simple, LARGE patterns only (big stripes, large polka dots)
+  • No intricate patterns or micro-textures
+  • Accessories allowed: hat, tool, bag, simple clothing details
+
+BACKGROUND:
+  • Simple scene elements that support the story context
+  • Trees, clouds, furniture outlines, simple landscape shapes
+  • Background should answer "where is this?" without overwhelming
+  • Main character still clearly dominant in visual hierarchy
+
+ACTION TEST:
+  Can a child describe this page starting with a VERB?
+  "The dragon is running from..." "The robot is learning to..." "The cat is sailing..."
 """
     }
 
@@ -299,8 +352,8 @@ YOUR CREATIVE PROCESS
 STEP 1: FIND THE HEART
   What makes this idea FUN, SWEET, or FUNNY?
   What's the emotion you want to evoke?
-  
-STEP 2: CHOOSE THE MOMENT  
+
+STEP 2: CHOOSE THE MOMENT
   Pick ONE specific instant that captures the heart.
   Not "a cat" but "a cat stretching after a nap, mid-yawn"
   Not "a rocket" but "a rocket just lifting off, with excited passengers waving"
@@ -314,18 +367,27 @@ STEP 3: ADD STORY DEPTH (not decoration)
 
 STEP 4: COMPOSE WITH BREATHING ROOM
   - Place your star character prominently
-  - Let supporting elements orbit naturally  
+  - Let supporting elements orbit naturally
   - Leave white space — it's not emptiness, it's rest for the eyes
   - Check: can a child tell what to color first?
+
+STEP 5: AGE-APPROPRIATENESS CHECK
+  Before finalizing, verify your design matches the target age:
+  □ Element count within specified range?
+  □ Coloring regions large enough? (check minimum % requirement)
+  □ Line weight appropriate? (bold for younger, medium for older)
+  □ Shape roundness matches age spec?
+  □ Interior detail level appropriate?
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 TECHNICAL REQUIREMENTS (non-negotiable for print quality)
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 • Pure black outlines on pure white — no fills, no gradients, no gray
-• All shapes fully closed with comfortable coloring regions  
+• All shapes fully closed with comfortable coloring regions
 • Uniform line weight, smooth confident strokes
 • No text, symbols, tiny details, or cramped areas
 • Clear silhouettes readable at a glance
+• Characters should look CHUBBY, ROUNDED, and HUGGABLE
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 FINAL CHECK: Does this page make you want to pick up crayons?
@@ -840,19 +902,19 @@ class ImageGenerator:
 def default_test_set() -> List[IdeaInput]:
     """默认测试集"""
     return [
-        # 幼儿模式
-        IdeaInput("A smiling teddy bear having a tea party", AgeMode.TODDLER, Orientation.AUTO),
-        IdeaInput("A bunny wearing rain boots, splashing in puddles", AgeMode.TODDLER, Orientation.AUTO),
-        IdeaInput("A friendly sun peeking over a hill", AgeMode.TODDLER, Orientation.PORTRAIT),
-        
-        # 儿童模式 - 动作场景
-        IdeaInput("A pirate cat sailing a paper boat in a bathtub ocean", AgeMode.KIDS, Orientation.AUTO),
-        IdeaInput("A dragon who's afraid of a tiny butterfly", AgeMode.KIDS, Orientation.AUTO),
-        IdeaInput("A robot learning to ride a bicycle, looking wobbly", AgeMode.KIDS, Orientation.AUTO),
-        
-        # 儿童模式 - 横版场景
-        IdeaInput("An astronaut having a picnic on the moon with alien friends", AgeMode.KIDS, Orientation.LANDSCAPE),
-        IdeaInput("A magical underwater world with playful fish and a friendly octopus", AgeMode.KIDS, Orientation.LANDSCAPE),
+        # LITTLE_ONES 模式 (3-5岁)
+        IdeaInput("A chubby teddy bear having a tea party", AgeMode.LITTLE_ONES, Orientation.AUTO),
+        IdeaInput("A plump bunny wearing rain boots, splashing in puddles", AgeMode.LITTLE_ONES, Orientation.AUTO),
+        IdeaInput("A friendly sun peeking over a hill", AgeMode.LITTLE_ONES, Orientation.PORTRAIT),
+
+        # YOUNG_ARTISTS 模式 (6岁+) - 动作场景
+        IdeaInput("A pirate cat sailing a paper boat in a bathtub ocean", AgeMode.YOUNG_ARTISTS, Orientation.AUTO),
+        IdeaInput("A dragon who's terrified of a tiny butterfly", AgeMode.YOUNG_ARTISTS, Orientation.AUTO),
+        IdeaInput("A robot learning to ride a bicycle, wobbling hilariously", AgeMode.YOUNG_ARTISTS, Orientation.AUTO),
+
+        # YOUNG_ARTISTS 模式 (6岁+) - 横版场景
+        IdeaInput("An astronaut having a picnic on the moon with alien friends", AgeMode.YOUNG_ARTISTS, Orientation.LANDSCAPE),
+        IdeaInput("A magical underwater world with playful fish and a friendly octopus", AgeMode.YOUNG_ARTISTS, Orientation.LANDSCAPE),
     ]
 
 
@@ -918,7 +980,7 @@ def run_batch(gen: ImageGenerator, cases: List[IdeaInput], model: str, out_dir: 
 # ============================================================
 
 def parse_args():
-    p = argparse.ArgumentParser(description="儿童涂色卡生成器 v3.1")
+    p = argparse.ArgumentParser(description="儿童涂色卡生成器 v3.3 - Modern Storybook Style")
     p.add_argument("--model", default="gpt-image-1-mini", help="模型别名或完整 model id")
     p.add_argument("--out", default="output_v3", help="输出目录")
     p.add_argument("--retry", type=int, default=1, help="每条用例重试次数")
@@ -927,8 +989,13 @@ def parse_args():
     p.add_argument("--generate", type=str, default=None, help="输入 idea 生成涂色卡")
     p.add_argument("--batch", action="store_true", help="跑默认批量测试集")
 
-    p.add_argument("--toddler", action="store_true", help="toddler 模式（2-4岁）")
-    p.add_argument("--kids", action="store_true", help="kids 模式（5-8岁，默认）")
+    # 年龄模式：新参数
+    p.add_argument("--little", action="store_true", help="3-5岁模式 (little_ones)")
+    p.add_argument("--young", action="store_true", help="6岁+模式 (young_artists，默认)")
+    # 年龄模式：旧参数别名（兼容）
+    p.add_argument("--toddler", action="store_true", help="[别名] 等同于 --little")
+    p.add_argument("--kids", action="store_true", help="[别名] 等同于 --young")
+
     p.add_argument("--portrait", action="store_true", help="竖版")
     p.add_argument("--landscape", action="store_true", help="横版")
     p.add_argument("--auto", action="store_true", help="自动检测横竖版")
@@ -939,9 +1006,13 @@ def parse_args():
 def main():
     args = parse_args()
 
-    age_mode = AgeMode.TODDLER if args.toddler else AgeMode.KIDS
-    if args.kids:
-        age_mode = AgeMode.KIDS
+    # 年龄模式处理：--little/--toddler → LITTLE_ONES, --young/--kids → YOUNG_ARTISTS
+    # 默认为 YOUNG_ARTISTS
+    age_mode = AgeMode.YOUNG_ARTISTS
+    if args.little or args.toddler:
+        age_mode = AgeMode.LITTLE_ONES
+    elif args.young or args.kids:
+        age_mode = AgeMode.YOUNG_ARTISTS
 
     orientation = Orientation.PORTRAIT
     if args.landscape:
@@ -984,12 +1055,16 @@ def main():
 
     # 默认：提示用法
     print("=" * 60)
-    print("儿童涂色卡生成器 v3.1")
+    print("儿童涂色卡生成器 v3.3")
     print("=" * 60)
+    print("\n年龄模式：")
+    print("  --little  3-5岁模式 (little_ones): 极简、大区域、粗线条")
+    print("  --young   6岁+模式 (young_artists，默认): 动态、故事感、适度细节")
     print("\n用法示例：")
+    print('  python coloring_generator.py --generate "A bunny eating carrots" --little --auto')
+    print('  python coloring_generator.py --generate "A bunny eating carrots" --young --auto')
     print('  python coloring_generator.py --generate "A friendly dragon" --auto')
-    print('  python coloring_generator.py --generate "小熊喝茶" --toddler')
-    print('  python coloring_generator.py --generate "海盗猫的冒险" --kids --landscape')
+    print('  python coloring_generator.py --generate "海盗猫的冒险" --young --landscape')
     print("  python coloring_generator.py --batch")
     print("\n支持的模型：")
     for name, config in MODEL_CONFIG.items():
