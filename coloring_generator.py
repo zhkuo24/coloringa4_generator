@@ -340,6 +340,14 @@ ABSOLUTE RESTRICTIONS
   ✗ No overlapping lines, tangles, or doubled strokes
   ✗ No tiny details smaller than a crayon tip could color
 
+CRITICAL - NO COLOR, NO BORDERS:
+  ✗ ABSOLUTELY NO colored elements — everything must be pure black lines on white
+  ✗ NO decorative borders or frames around the image
+  ✗ NO colored backgrounds, tinted areas, or any fill colors
+  ✗ NO fancy edges, ornamental corners, or border decorations
+  ✗ The image must have clean edges with NO border whatsoever
+  ✗ Output ONLY black outlines on pure white — zero exceptions
+
 ═══════════════════════════════════════════════════════════════
 COLORING-FRIENDLY CHECKLIST (before finalizing)
 ═══════════════════════════════════════════════════════════════
@@ -523,6 +531,8 @@ TECHNICAL REQUIREMENTS (non-negotiable for print quality)
 • No text, symbols, tiny details, or cramped areas
 • Clear silhouettes readable at a glance
 • Characters should look CHUBBY, ROUNDED, and HUGGABLE
+• CRITICAL: NO colored elements, NO decorative borders, NO frames
+• The output must be ONLY black lines on white — absolutely no color anywhere
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 FINAL CHECK: Does this page make you want to pick up crayons?
