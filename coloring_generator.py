@@ -221,6 +221,40 @@ def process_to_a4(png_path: str, dpi: int = 300) -> Dict[str, Optional[str]]:
     return result
 
 
+def postprocess_pngs(
+    input_path: str,
+    output_dir: str,
+    recursive: bool,
+    mirror: bool,
+    dpi: int,
+    webp_quality: int,
+    write_a4_png: bool,
+    pdf_jpeg: bool,
+    pdf_jpeg_quality: int,
+) -> None:
+    try:
+        from batch_convert_a4 import batch_convert
+    except Exception as exc:
+        print(f"[Postprocess] Skip: {exc}")
+        return
+
+    try:
+        batch_convert(
+            input_path=Path(input_path),
+            output_dir=Path(output_dir),
+            dpi=dpi,
+            webp_quality=webp_quality,
+            recursive=recursive,
+            overwrite=False,
+            write_a4_png=write_a4_png,
+            mirror=mirror,
+            pdf_jpeg=pdf_jpeg,
+            pdf_jpeg_quality=pdf_jpeg_quality,
+        )
+    except Exception as exc:
+        print(f"[Postprocess] Failed: {exc}")
+
+
 # ============================================================
 # Prompt System v2.0（故事优先，规则护航）
 # ============================================================
@@ -1364,6 +1398,46 @@ def parse_args():
     p.add_argument("--landscape", action="store_true", help="横版")
     p.add_argument("--auto", action="store_true", help="自动检测横竖版")
 
+    p.add_argument("--postprocess", action="store_true", help="生成后批量转 WebP/PDF")
+    p.add_argument(
+        "--postprocess-out",
+        default=None,
+        help="后处理输出目录（默认使用 --out）",
+    )
+    p.add_argument(
+        "--postprocess-recursive",
+        action="store_true",
+        help="后处理时递归子目录",
+    )
+    p.add_argument(
+        "--postprocess-mirror",
+        action="store_true",
+        help="后处理时镜像输入目录结构",
+    )
+    p.add_argument("--postprocess-dpi", type=int, default=300, help="后处理 DPI")
+    p.add_argument(
+        "--postprocess-webp-quality",
+        type=int,
+        default=85,
+        help="后处理 WebP 质量",
+    )
+    p.add_argument(
+        "--postprocess-write-a4-png",
+        action="store_true",
+        help="后处理时额外写出 A4 PNG",
+    )
+    p.add_argument(
+        "--postprocess-no-pdf-jpeg",
+        action="store_true",
+        help="后处理时禁用 PDF JPEG 压缩",
+    )
+    p.add_argument(
+        "--postprocess-pdf-jpeg-quality",
+        type=int,
+        default=90,
+        help="后处理 PDF JPEG 质量",
+    )
+
     return p.parse_args()
 
 
@@ -1389,6 +1463,7 @@ def main():
     gen = ImageGenerator(base_url=args.base_url)
     out_dir = args.out
     Path(out_dir).mkdir(parents=True, exist_ok=True)
+    postprocess_out_dir = args.postprocess_out or out_dir
 
     # 按年龄分组批量生成
     if args.batch_age:
@@ -1403,11 +1478,35 @@ def main():
             age_groups=age_groups,
             start_index=args.start_index,
         )
+        if args.postprocess:
+            postprocess_pngs(
+                input_path=out_dir,
+                output_dir=postprocess_out_dir,
+                recursive=True,
+                mirror=True,
+                dpi=args.postprocess_dpi,
+                webp_quality=args.postprocess_webp_quality,
+                write_a4_png=args.postprocess_write_a4_png,
+                pdf_jpeg=not args.postprocess_no_pdf_jpeg,
+                pdf_jpeg_quality=args.postprocess_pdf_jpeg_quality,
+            )
         return
 
     if args.batch:
         cases = default_test_set()
         run_batch(gen, cases, args.model, out_dir, args.retry)
+        if args.postprocess:
+            postprocess_pngs(
+                input_path=out_dir,
+                output_dir=postprocess_out_dir,
+                recursive=args.postprocess_recursive,
+                mirror=args.postprocess_mirror,
+                dpi=args.postprocess_dpi,
+                webp_quality=args.postprocess_webp_quality,
+                write_a4_png=args.postprocess_write_a4_png,
+                pdf_jpeg=not args.postprocess_no_pdf_jpeg,
+                pdf_jpeg_quality=args.postprocess_pdf_jpeg_quality,
+            )
         return
 
     if args.generate:
@@ -1430,6 +1529,18 @@ def main():
             "model": res.get("model"),
             "api_type": res.get("api_type"),
         }, ensure_ascii=False, indent=2))
+        if args.postprocess and res.get("save_path"):
+            postprocess_pngs(
+                input_path=res["save_path"],
+                output_dir=postprocess_out_dir,
+                recursive=False,
+                mirror=False,
+                dpi=args.postprocess_dpi,
+                webp_quality=args.postprocess_webp_quality,
+                write_a4_png=args.postprocess_write_a4_png,
+                pdf_jpeg=not args.postprocess_no_pdf_jpeg,
+                pdf_jpeg_quality=args.postprocess_pdf_jpeg_quality,
+            )
         return
 
     # 默认：提示用法
