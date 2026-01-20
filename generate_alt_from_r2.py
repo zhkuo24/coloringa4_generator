@@ -107,8 +107,8 @@ def main() -> None:
     )
     parser.add_argument(
         "--model",
-        default="gemini-2.5-flash-all",
-        help="Gemini model id (default: gemini-2.5-flash-all)",
+        default="gemini-3-pro-image-preview",
+        help="Gemini model id (default: gemini-3-pro-image-preview)",
     )
     parser.add_argument(
         "--base-url",
@@ -128,8 +128,8 @@ def main() -> None:
     args = parser.parse_args()
 
     load_env(args.env_file)
-    api_key = os.getenv("API_KEY")
-    base_url = args.base_url or os.getenv("API_BASE_URL", "https://yunwu.ai/v1beta")
+    api_key = os.getenv("GEMINI_API_KEY")
+    base_url = args.base_url or os.getenv("GEMINI_API_BASE_URL", "https://yunwu.ai/v1beta")
     if not api_key:
         raise RuntimeError("Missing API_KEY in environment or .env")
 

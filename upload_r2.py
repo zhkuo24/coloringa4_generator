@@ -159,9 +159,7 @@ if __name__ == "__main__":
   # API_KEY=...
   # API_BASE_URL=https://yunwu.ai/v1beta
 
-#   python generate_alt_from_r2.py r2_links.csv \
-#     --output-csv r2_links_with_alt.csv \
-#     --model gemini-2.5-flash-all
+# python generate_alt_from_r2.py r2_links.csv --output-csv r2_links_with_alt.csv --model gemini-2.5-flash-all
 
 #   如果你想直接写死到你给的接口，也可以用：
 
